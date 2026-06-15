@@ -9,8 +9,10 @@ const fs    = require('fs');
 const http  = require('http');
 
 // ── Clientes API ──────────────────────────────────────────
-const bot  = new Bot(process.env.TELEGRAM_TOKEN);
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const bot       = new Bot(process.env.TELEGRAM_TOKEN);
+const groq      = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const Anthropic = require('@anthropic-ai/sdk');
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ── Estado en memoria  chatId → { paso, datos } ──────────
 const sesiones = new Map();
@@ -93,6 +95,51 @@ function maletin(n) {
   return p >= 6 ? 10000000 : p >= 4 ? 7000000 : p >= 2 ? 5000000 : 2000000;
 }
 
+// ── Plan completo con Claude ──────────────────────────────
+async function generarPlanCompleto(datos) {
+  const p   = Number(datos.precio1)     || 0;
+  const u   = Number(datos.unidadesMes) || 0;
+  const cv  = Number(datos.costoUnit)   || 0;
+  const cf  = Number(datos.costosFijos) || 0;
+  const inv = Number(datos.inversion)   || 0;
+  const ap  = Number(datos.aporte)      || 0;
+  const np  = Number(datos.numPersonas) || 1;
+
+  const prompt = `Eres un asesor del SENA Colombia experto en planes de negocio para la Línea CREAR Especial (víctimas del conflicto, campesinos, desplazados). Redacta en español claro, formal y empático. Máximo 200 palabras por sección. Responde SOLO con el JSON sin texto adicional ni bloques de código.
+
+DATOS DEL BENEFICIARIO:
+- Nombre: ${datos.nombre} | Grupo: ${datos.grupo}
+- Ubicación: ${datos.municipio}, ${datos.departamento}
+- Proyecto: ${datos.nombreProyecto} (${datos.tipoProyecto} · ${datos.sector})
+- Modalidad: ${/asoc/i.test(datos.asociativo || '') ? `Asociativo — ${np} personas` : 'Individual'}
+- Negocio: ${datos.descripcion}
+- Producto/servicio: ${datos.producto1} a $${p.toLocaleString('es-CO')} · ${u} unidades/mes
+- Cliente objetivo: ${datos.cliente}
+- Problema que resuelve: ${datos.problema}
+- Costo unitario: $${cv.toLocaleString('es-CO')} · Costos fijos: $${cf.toLocaleString('es-CO')}/mes
+- Inversión total: $${inv.toLocaleString('es-CO')} · Aporte propio: $${ap.toLocaleString('es-CO')}
+
+{
+  "descripcionNegocio": "Narrativa del negocio: propuesta de valor, origen y contexto del emprendedor.",
+  "mercadoObjetivo": "Perfil del cliente ideal, frecuencia de compra, tamaño de mercado local estimado.",
+  "analisisCompetencia": "Competidores directos e indirectos en la zona. Ventajas diferenciales del proyecto.",
+  "estrategiaComercial": "Canales de venta, estrategia de precios, promoción y fidelización de clientes.",
+  "planOperativo": "Proceso productivo paso a paso, proveedores clave, capacidad instalada y horarios.",
+  "analisisRiesgos": "3 riesgos principales con probabilidad, impacto y plan de mitigación para cada uno.",
+  "justificacionInversion": "Desglose de la inversión por rubro (maquinaria, insumos, adecuaciones, capital de trabajo) con justificación de cada uno."
+}`;
+
+  const msg = await anthropic.messages.create({
+    model:      'claude-haiku-4-5-20251001',
+    max_tokens: 3500,
+    messages:   [{ role: 'user', content: prompt }],
+  });
+
+  const raw = msg.content[0].text.trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  return JSON.parse(raw);
+}
+
 // ── Transcripción Groq Whisper ────────────────────────────
 async function transcribir(fileId) {
   const info = await bot.api.getFile(fileId);
@@ -115,7 +162,7 @@ async function transcribir(fileId) {
 }
 
 // ── Generar Excel ─────────────────────────────────────────
-function generarExcel(datos) {
+function generarExcel(datos, planIA = null) {
   const p   = Number(datos.precio1)     || 0;
   const u   = Number(datos.unidadesMes) || 0;
   const cv  = Number(datos.costoUnit)   || 0;
@@ -201,6 +248,32 @@ function generarExcel(datos) {
   ws2['!cols'] = [{ wch: 42 }, { wch: 22 }];
   XLSX.utils.book_append_sheet(wb, ws2, 'MODELO FINANCIERO');
 
+  // Hoja 3 — Plan narrativo generado por IA (solo si Claude respondió)
+  if (planIA) {
+    const secciones = [
+      ['DESCRIPCIÓN DEL NEGOCIO',     planIA.descripcionNegocio],
+      ['MERCADO OBJETIVO',             planIA.mercadoObjetivo],
+      ['ANÁLISIS DE COMPETENCIA',      planIA.analisisCompetencia],
+      ['ESTRATEGIA COMERCIAL',         planIA.estrategiaComercial],
+      ['PLAN OPERATIVO',               planIA.planOperativo],
+      ['ANÁLISIS DE RIESGOS',          planIA.analisisRiesgos],
+      ['JUSTIFICACIÓN DE LA INVERSIÓN', planIA.justificacionInversion],
+    ];
+    const filas = [
+      ['PLAN DE NEGOCIO COMPLETO — SENA LÍNEA CREAR ESPECIAL'],
+      ['Generado con IA · ' + new Date().toLocaleDateString('es-CO')],
+      [],
+    ];
+    for (const [titulo, contenido] of secciones) {
+      filas.push([titulo]);
+      filas.push([contenido || '']);
+      filas.push([]);
+    }
+    const ws3 = XLSX.utils.aoa_to_sheet(filas);
+    ws3['!cols'] = [{ wch: 120 }];
+    XLSX.utils.book_append_sheet(wb, ws3, 'PLAN NARRATIVO');
+  }
+
   return wb;
 }
 
@@ -233,9 +306,17 @@ async function procesarRespuesta(ctx, texto) {
 
 // ── Finalizar: generar y enviar Excel ────────────────────
 async function finalizar(ctx, sesion) {
-  await ctx.reply('🎉 *¡Plan completado!* Generando el Excel…', { parse_mode: 'Markdown' });
+  await ctx.reply('🎉 *¡Plan completado!* Generando el plan de negocio con IA… ⏳', { parse_mode: 'Markdown' });
 
-  const wb     = generarExcel(sesion.datos);
+  let planIA = null;
+  try {
+    planIA = await generarPlanCompleto(sesion.datos);
+  } catch (e) {
+    console.error('Claude API error:', e.message);
+    await ctx.reply('⚠️ No pude generar las secciones narrativas, pero el Excel con los datos está listo.');
+  }
+
+  const wb     = generarExcel(sesion.datos, planIA);
   const nombre = (sesion.datos.nombre || 'beneficiario').replace(/\s+/g, '_');
   const fecha  = new Date().toISOString().slice(0, 10);
   const fn     = `PlanNegocio_${nombre}_${fecha}.xlsx`;

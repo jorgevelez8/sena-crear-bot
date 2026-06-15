@@ -9,6 +9,7 @@
   "dependencies": {
     "grammy": "^1.21.0",
     "groq-sdk": "^0.3.3",
+    "@anthropic-ai/sdk": "^0.36.3",
     "axios": "^1.6.8",
     "xlsx": "^0.18.5",
     "dotenv": "^16.4.5"
