@@ -65,6 +65,12 @@ const PREGUNTAS = [
 ];
 
 // ── Helpers ───────────────────────────────────────────────
+function limpiarNombre(texto) {
+  return texto
+    .replace(/^(mi nombre (completo )?es|me llamo|yo me llamo|soy|yo soy|me dicen)\s+/i, '')
+    .trim();
+}
+
 function getSesion(chatId) {
   if (!sesiones.has(chatId)) sesiones.set(chatId, { paso: 0, datos: {} });
   return sesiones.get(chatId);
@@ -206,11 +212,12 @@ async function procesarRespuesta(ctx, texto) {
   if (!actual) return;
 
   const { p, i } = actual;
-  sesion.datos[p.key] = texto;
+  const valor = p.key === 'nombre' ? limpiarNombre(texto) : texto;
+  sesion.datos[p.key] = valor;
   sesion.paso = i + 1;
 
   // Confirmación
-  const preview = texto.length > 120 ? texto.slice(0, 120) + '…' : texto;
+  const preview = valor.length > 120 ? valor.slice(0, 120) + '…' : valor;
   await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
 
   // Siguiente pregunta o finalizar
