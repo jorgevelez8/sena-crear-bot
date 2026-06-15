@@ -95,6 +95,38 @@ function maletin(n) {
   return p >= 6 ? 10000000 : p >= 4 ? 7000000 : p >= 2 ? 5000000 : 2000000;
 }
 
+// Devuelve la lista de preguntas respondidas con número de display
+function getResumenItems(sesion) {
+  const items = [];
+  let num = 1;
+  for (const p of PREGUNTAS) {
+    if (p.soloSi && !p.soloSi(sesion.datos)) continue;
+    const label = p.msg.match(/\*([^*]+)\*/)?.[1] || p.key;
+    items.push({ num, key: p.key, label, valor: sesion.datos[p.key] || '' });
+    num++;
+  }
+  return items;
+}
+
+async function mostrarResumen(ctx, sesion) {
+  const items = getResumenItems(sesion);
+  const lineas = ['📋 *Revisa las respuestas antes de generar el plan:*\n'];
+  for (const it of items) {
+    const val = it.valor.length > 55 ? it.valor.slice(0, 55) + '…' : it.valor;
+    lineas.push(`*${it.num}.* ${it.label}: _${val || '–'}_`);
+  }
+  lineas.push('\n✅ Escribe */listo* para generar el plan completo');
+  lineas.push('✏️ Escribe el *número* de lo que quieras corregir _(ej: 3)_');
+  await ctx.reply(lineas.join('\n'), { parse_mode: 'Markdown' });
+}
+
+function getLastAnsweredIndex(sesion) {
+  for (let i = sesion.paso - 1; i >= 0; i--) {
+    if (sesion.datos[PREGUNTAS[i]?.key] !== undefined) return i;
+  }
+  return -1;
+}
+
 // ── Plan completo con Claude ──────────────────────────────
 async function generarPlanCompleto(datos) {
   const p   = Number(datos.precio1)     || 0;
@@ -293,14 +325,14 @@ async function procesarRespuesta(ctx, texto) {
   const preview = valor.length > 120 ? valor.slice(0, 120) + '…' : valor;
   await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
 
-  // Siguiente pregunta o finalizar
+  // Siguiente pregunta o pasar a revisión
   const sig = getPregunta(sesion.paso, sesion.datos);
   if (sig) {
     const progreso = `_(${sesion.paso}/${PREGUNTAS.length})_`;
     await ctx.reply(`${sig.p.msg}\n\n${progreso}`, { parse_mode: 'Markdown' });
   } else {
-    await finalizar(ctx, sesion);
-    sesiones.delete(chatId);
+    sesion.modo = 'revisando';
+    await mostrarResumen(ctx, sesion);
   }
 }
 
@@ -346,8 +378,10 @@ bot.command('start', async ctx => {
     '👋 *Bienvenido al Bot SENA · Línea CREAR*\n\n' +
     'Te voy a guiar para crear el *Plan de Negocio* paso a paso.\n' +
     'Puedes responder con voz 🎤 o escribiendo ✍️\n\n' +
-    '🔄 /reiniciar — Cancelar y empezar de cero\n' +
-    '📋 /estado — Ver progreso\n\n' +
+    '↩️ /atras — Corregir la respuesta anterior\n' +
+    '📋 /resumen — Ver y corregir todas las respuestas\n' +
+    '✅ /listo — Generar el plan (al final)\n' +
+    '🔄 /reiniciar — Cancelar y empezar de cero\n\n' +
     '─────────────────────',
     { parse_mode: 'Markdown' }
   );
@@ -377,6 +411,52 @@ bot.command('reiniciar', async ctx => {
   await ctx.reply('🔄 Plan cancelado. Usa /nuevo para empezar de cero.');
 });
 
+bot.command('atras', async ctx => {
+  const chatId = ctx.chat.id;
+  const sesion = getSesion(chatId);
+  if (sesion.modo === 'revisando') {
+    sesion.modo = undefined;
+    await ctx.reply('↩️ Volviste al flujo de preguntas. Escribe /resumen cuando termines.');
+    return;
+  }
+  const lastIdx = getLastAnsweredIndex(sesion);
+  if (lastIdx < 0) {
+    await ctx.reply('Ya estás en la primera pregunta.');
+    return;
+  }
+  delete sesion.datos[PREGUNTAS[lastIdx].key];
+  sesion.paso = lastIdx;
+  const p = getPregunta(sesion.paso, sesion.datos);
+  if (p) {
+    await ctx.reply(
+      `↩️ *Volvamos atrás:*\n\n${p.p.msg}\n\n_(${sesion.paso + 1}/${PREGUNTAS.length})_`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+bot.command('resumen', async ctx => {
+  const chatId = ctx.chat.id;
+  const sesion = sesiones.get(chatId);
+  if (!sesion || Object.keys(sesion.datos).length === 0) {
+    await ctx.reply('No hay ningún plan en curso. Usa /nuevo para empezar.');
+    return;
+  }
+  sesion.modo = 'revisando';
+  await mostrarResumen(ctx, sesion);
+});
+
+bot.command('listo', async ctx => {
+  const chatId = ctx.chat.id;
+  const sesion = sesiones.get(chatId);
+  if (!sesion || sesion.modo !== 'revisando') {
+    await ctx.reply('Primero completa el cuestionario. Usa /nuevo para empezar.');
+    return;
+  }
+  await finalizar(ctx, sesion);
+  sesiones.delete(chatId);
+});
+
 bot.command('estado', async ctx => {
   const sesion = getSesion(ctx.chat.id);
   const actual = getPregunta(sesion.paso, sesion.datos);
@@ -392,20 +472,42 @@ bot.command('estado', async ctx => {
   );
 });
 
+// ── Guardar corrección (modo corrigiendo) ─────────────────
+async function aplicarCorreccion(ctx, sesion, texto) {
+  const key   = sesion.corrigiendoKey;
+  const valor = key === 'nombre' ? limpiarNombre(texto) : texto;
+  sesion.datos[key] = valor;
+  sesion.modo = 'revisando';
+  const preview = valor.length > 80 ? valor.slice(0, 80) + '…' : valor;
+  await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
+  await mostrarResumen(ctx, sesion);
+}
+
 // ── Mensajes de voz / audio ───────────────────────────────
 bot.on(['message:voice', 'message:audio'], async ctx => {
-  const sesion = getSesion(ctx.chat.id);
-  const actual = getPregunta(sesion.paso, sesion.datos);
-  if (!actual) {
-    await ctx.reply('Usa /nuevo para iniciar un plan.');
+  const sesion    = getSesion(ctx.chat.id);
+  const enRevision = sesion.modo === 'revisando';
+  const enCorreccion = sesion.modo === 'corrigiendo';
+  const actual    = getPregunta(sesion.paso, sesion.datos);
+
+  if (!actual && !enCorreccion) {
+    await ctx.reply(enRevision
+      ? '📋 Estás revisando el plan. Escribe el número a corregir o */listo*.'
+      : 'Usa /nuevo para iniciar un plan.',
+      { parse_mode: 'Markdown' });
     return;
   }
+
   const msg = await ctx.reply('🎤 Transcribiendo…');
   try {
     const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
     const texto  = await transcribir(fileId);
     await ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
-    await procesarRespuesta(ctx, texto);
+    if (enCorreccion) {
+      await aplicarCorreccion(ctx, sesion, texto);
+    } else {
+      await procesarRespuesta(ctx, texto);
+    }
   } catch (e) {
     console.error('Transcripción fallida:', e.message);
     await ctx.reply('❌ No pude escuchar bien. Intenta de nuevo o escribe la respuesta.');
@@ -415,7 +517,39 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
 // ── Mensajes de texto ─────────────────────────────────────
 bot.on('message:text', async ctx => {
   if (ctx.message.text.startsWith('/')) return;
-  const sesion = getSesion(ctx.chat.id);
+  const chatId = ctx.chat.id;
+  const sesion = getSesion(chatId);
+
+  // Modo revisando: espera número de pregunta
+  if (sesion.modo === 'revisando') {
+    const n = parseInt(ctx.message.text.trim(), 10);
+    if (!isNaN(n) && n >= 1) {
+      const items = getResumenItems(sesion);
+      const item  = items.find(it => it.num === n);
+      if (item) {
+        sesion.modo = 'corrigiendo';
+        sesion.corrigiendoKey = item.key;
+        const pregunta = PREGUNTAS.find(p => p.key === item.key);
+        await ctx.reply(
+          `✏️ *Corrigiendo #${n} — ${item.label}*\n\n${pregunta.msg}\n\n_Responde con voz 🎤 o escribe el nuevo valor:_`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await ctx.reply(`No encontré la pregunta ${n}. Escribe un número del 1 al ${items.length} o */listo*.`, { parse_mode: 'Markdown' });
+      }
+    } else {
+      await ctx.reply('Escribe el *número* de la pregunta a corregir, o */listo* para generar el plan.', { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
+  // Modo corrigiendo: guarda texto y vuelve al resumen
+  if (sesion.modo === 'corrigiendo') {
+    await aplicarCorreccion(ctx, sesion, ctx.message.text);
+    return;
+  }
+
+  // Flujo normal
   const actual = getPregunta(sesion.paso, sesion.datos);
   if (!actual) {
     await ctx.reply('Usa /nuevo para iniciar un plan.');
