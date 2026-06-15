@@ -252,21 +252,33 @@ async function finalizar(ctx, sesion) {
 }
 
 // ── Comandos ──────────────────────────────────────────────
-bot.command('start', ctx => ctx.reply(
-  '👋 *Bot SENA · Línea CREAR*\n\n' +
-  'Registro de planes de negocio por voz.\n\n' +
-  '▶️ /nuevo — Iniciar un plan\n' +
-  '🔄 /reiniciar — Cancelar y empezar de cero\n' +
-  '📋 /estado — Ver progreso actual',
-  { parse_mode: 'Markdown' }
-));
-
-bot.command('nuevo', async ctx => {
+bot.command('start', async ctx => {
   sesiones.delete(ctx.chat.id);
+  await ctx.reply(
+    '👋 *Bienvenido al Bot SENA · Línea CREAR*\n\n' +
+    'Te voy a guiar para crear el *Plan de Negocio* paso a paso.\n' +
+    'Puedes responder con voz 🎤 o escribiendo ✍️\n\n' +
+    '🔄 /reiniciar — Cancelar y empezar de cero\n' +
+    '📋 /estado — Ver progreso\n\n' +
+    '─────────────────────',
+    { parse_mode: 'Markdown' }
+  );
   const primera = getPregunta(0, {});
   if (primera) {
     await ctx.reply(
-      primera.p.msg + `\n\n_(1/${PREGUNTAS.length})_`,
+      primera.p.msg + `\n\n_(Pregunta 1 de ${PREGUNTAS.length})_`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+bot.command('nuevo', async ctx => {
+  sesiones.delete(ctx.chat.id);
+  await ctx.reply('🆕 Iniciando nuevo plan de negocio...');
+  const primera = getPregunta(0, {});
+  if (primera) {
+    await ctx.reply(
+      primera.p.msg + `\n\n_(Pregunta 1 de ${PREGUNTAS.length})_`,
       { parse_mode: 'Markdown' }
     );
   }
