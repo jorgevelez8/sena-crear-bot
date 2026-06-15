@@ -660,12 +660,16 @@ bot.command('start', async ctx => {
   sesiones.delete(ctx.chat.id);
   await ctx.reply(
     '👋 *Bienvenido al Bot SENA · Línea CREAR Especial*\n\n' +
-    'Te voy a guiar para crear el *Plan de Negocio* oficial paso a paso.\n' +
-    'Puedes responder con voz 🎤 o escribiendo ✍️\n\n' +
-    '↩️ /atras — Corregir la respuesta anterior\n' +
+    '*Plan de Negocio:*\n' +
+    '📝 /nuevo — Crear plan de negocio (38 preguntas)\n' +
+    '↩️ /atras — Corregir respuesta anterior\n' +
     '📋 /resumen — Ver y corregir todas las respuestas\n' +
-    '✅ /listo — Generar el plan (al final)\n' +
+    '✅ /listo — Generar el Excel oficial SENA\n' +
     '🔄 /reiniciar — Cancelar y empezar de cero\n\n' +
+    '*Diagnóstico Empresarial:*\n' +
+    '🏥 /dx — Iniciar diagnóstico (40 preguntas 0/1/2)\n' +
+    '📊 /dx_resumen — Ver puntajes actuales\n' +
+    '✅ /dx_listo — Generar Excel del diagnóstico\n\n' +
     '─────────────────────',
     { parse_mode: 'Markdown' }
   );
@@ -771,7 +775,30 @@ async function aplicarCorreccion(ctx, sesion, texto) {
 
 // ── Mensajes de voz / audio ───────────────────────────────
 bot.on(['message:voice', 'message:audio'], async ctx => {
-  const sesion       = getSesion(ctx.chat.id);
+  const chatId = ctx.chat.id;
+
+  // ── Flujo diagnóstico ──
+  if (dxSesiones.has(chatId)) {
+    const dxSesion = dxSesiones.get(chatId);
+    if (dxSesion.paso >= DX_TOTAL) {
+      await ctx.reply('El diagnóstico está completo. Usa /dx_listo para generar el Excel.');
+      return;
+    }
+    const msg = await ctx.reply('🎤 Transcribiendo…');
+    try {
+      const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
+      const texto  = await transcribir(fileId);
+      await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
+      await dxProcesarRespuesta(ctx, texto);
+    } catch (e) {
+      console.error('Transcripción dx fallida:', e.message);
+      await ctx.reply('❌ No pude escuchar. Intenta de nuevo o escribe 0, 1 o 2.');
+    }
+    return;
+  }
+
+  // ── Flujo plan de negocio ──
+  const sesion       = getSesion(chatId);
   const enRevision   = sesion.modo === 'revisando';
   const enCorreccion = sesion.modo === 'corrigiendo';
   const actual       = getPregunta(sesion.paso, sesion.datos);
@@ -779,7 +806,7 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
   if (!actual && !enCorreccion) {
     await ctx.reply(enRevision
       ? '📋 Estás revisando el plan. Escribe el número a corregir o */listo*.'
-      : 'Usa /nuevo para iniciar un plan.',
+      : 'Usa /nuevo para el plan de negocio o /dx para el diagnóstico.',
       { parse_mode: 'Markdown' });
     return;
   }
@@ -788,7 +815,7 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
   try {
     const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
     const texto  = await transcribir(fileId);
-    await ctx.api.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+    await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
     if (enCorreccion) {
       await aplicarCorreccion(ctx, sesion, texto);
     } else {
@@ -804,6 +831,19 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
 bot.on('message:text', async ctx => {
   if (ctx.message.text.startsWith('/')) return;
   const chatId = ctx.chat.id;
+
+  // ── Flujo diagnóstico ──
+  if (dxSesiones.has(chatId)) {
+    const dxSesion = dxSesiones.get(chatId);
+    if (dxSesion.paso >= DX_TOTAL) {
+      await ctx.reply('El diagnóstico está completo. Usa /dx_listo para generar el Excel.');
+      return;
+    }
+    await dxProcesarRespuesta(ctx, ctx.message.text);
+    return;
+  }
+
+  // ── Flujo plan de negocio ──
   const sesion = getSesion(chatId);
 
   if (sesion.modo === 'revisando') {
@@ -835,15 +875,298 @@ bot.on('message:text', async ctx => {
 
   const actual = getPregunta(sesion.paso, sesion.datos);
   if (!actual) {
-    await ctx.reply('Usa /nuevo para iniciar un plan.');
+    await ctx.reply('Usa /nuevo para el plan de negocio o /dx para el diagnóstico.');
     return;
   }
   await procesarRespuesta(ctx, ctx.message.text);
+});
+
+// ══════════════════════════════════════════════════════════
+// ── FLUJO DE DIAGNÓSTICO EMPRESARIAL (40 preguntas 0/1/2) ─
+// ══════════════════════════════════════════════════════════
+
+const dxSesiones = new Map(); // chatId → { paso, datos }
+
+// ── Datos básicos del diagnóstico (10 preguntas) ──────────
+const DX_BASICOS = [
+  { key: 'dxNombre',      msg: '¿Nombre completo del emprendedor?' },
+  { key: 'dxCedula',      msg: '¿Número de cédula?' },
+  { key: 'dxNegocio',     msg: '¿Nombre de la Unidad Productiva o negocio?' },
+  { key: 'dxCiiu',        msg: '¿Sector económico (CIIU)?\n_(Ej: 1411 Confección · 0111 Cultivos · 4711 Tienda)_' },
+  { key: 'dxTipo',        msg: '¿Tipo de iniciativa?\n_(Individual / Familiar / Asociativa)_' },
+  { key: 'dxTiempo',      msg: '¿Cuánto tiempo lleva funcionando el negocio?\n_(Ej: 2 años, 8 meses)_' },
+  { key: 'dxEmpleados',   msg: '¿Cuántos empleados tiene actualmente?' },
+  { key: 'dxDireccion',   msg: '¿Dirección de la Unidad Productiva?' },
+  { key: 'dxTelefono',    msg: '¿Teléfono o celular de contacto?' },
+  { key: 'dxDinamizador', msg: '¿Nombre del dinamizador que aplica el diagnóstico?' },
+];
+
+// ── 40 preguntas diagnóstico (escala 0/1/2) ───────────────
+const DX_PREGUNTAS = [
+  // Área 1 — Legal y Administrativa
+  { area: 1, num: 1,  msg: '¿Para la planeación estratégica y fijación de objetivos tiene en cuenta al *cliente interno* y las tendencias del mercado?' },
+  { area: 1, num: 2,  msg: '¿Es suficiente el número de trabajadores para el cumplimiento de las actividades diarias?' },
+  { area: 1, num: 3,  msg: '¿Cuenta con *reemplazos* en los momentos de ausencia prolongada de algún trabajador?' },
+  { area: 1, num: 4,  msg: '¿La Unidad Productiva está *bancarizada* para la gestión de ventas?' },
+  { area: 1, num: 5,  msg: '¿El emprendedor cuenta con *asignación de salario*?' },
+  { area: 1, num: 6,  msg: '¿El emprendedor y sus empleados están afiliados a *seguridad social*?' },
+  { area: 1, num: 7,  msg: '¿Tiene *estructura organizacional* definida? (organigrama, manual de funciones, perfiles)' },
+  { area: 1, num: 8,  msg: '¿Identifica y usa *elementos de protección personal*? ¿La UP está señalizada?' },
+  { area: 1, num: 9,  msg: '¿Ha implementado *herramientas de innovación* para mejorar competitivamente?' },
+  { area: 1, num: 10, msg: '¿Conoce los *permisos y licencias* que requiere? ¿Está comprometida con el medio ambiente?' },
+  // Área 2 — Comercial
+  { area: 2, num: 1,  msg: '¿Tiene claro qué *productos o servicios* ofrece al mercado? (todos ellos)' },
+  { area: 2, num: 2,  msg: '¿Conoce la *participación de cada producto* en el total de ventas?' },
+  { area: 2, num: 3,  msg: '¿Se fundamenta en datos para hacer *cambios en los productos o servicios*?' },
+  { area: 2, num: 4,  msg: '¿Tiene definido el *diferenciador* de su producto frente a la competencia?' },
+  { area: 2, num: 5,  msg: '¿Tiene identificado y caracterizado a su *cliente objetivo y potencial*?' },
+  { area: 2, num: 6,  msg: '¿Investiga *tendencias del sector* a nivel nacional e internacional?' },
+  { area: 2, num: 7,  msg: '¿Tiene en cuenta el *análisis de la competencia* en sus procesos? (precio, calidad, fortalezas)' },
+  { area: 2, num: 8,  msg: '¿Tiene *meta en ventas mensuales* y hace seguimiento a su cumplimiento?' },
+  { area: 2, num: 9,  msg: '¿Cuenta con *catálogo o portafolio* de productos/servicios?' },
+  { area: 2, num: 10, msg: '¿Cuenta con un *plan de fidelización* para los clientes?' },
+  // Área 3 — Técnica-Operativa
+  { area: 3, num: 1,  msg: '¿Identifica y cuantifica los *riesgos de producción* en sus procesos?' },
+  { area: 3, num: 2,  msg: '¿Existen *fichas técnicas* de máquinas, equipos y productos?' },
+  { area: 3, num: 3,  msg: '¿La *infraestructura física* es adecuada para el desarrollo de la actividad?' },
+  { area: 3, num: 4,  msg: '¿Los puestos de trabajo y maquinaria están distribuidos para *optimizar tiempos*?' },
+  { area: 3, num: 5,  msg: '¿Ha replicado algún *avance de la competencia* en su propia empresa?' },
+  { area: 3, num: 6,  msg: '¿Tiene un manejo adecuado de los *residuos* que genera la empresa?' },
+  { area: 3, num: 7,  msg: '¿El proceso de producción/servicio está *definido*? (etapas, tiempos, controles)' },
+  { area: 3, num: 8,  msg: '¿El producto puede *adaptarse* rápidamente a las tendencias del mercado?' },
+  { area: 3, num: 9,  msg: '¿Realiza *control de calidad* a su producto o servicio?' },
+  { area: 3, num: 10, msg: '¿Planea las compras de materia prima y tiene *control de inventarios*?' },
+  // Área 4 — Financiera y Contable
+  { area: 4, num: 1,  msg: '¿Separa los *gastos personales* de los gastos del negocio?' },
+  { area: 4, num: 2,  msg: '¿Tiene proceso definido para *fijar el precio* de sus productos/servicios?' },
+  { area: 4, num: 3,  msg: '¿Conoce su *margen de rentabilidad*?' },
+  { area: 4, num: 4,  msg: '¿Identifica si la empresa está *generando utilidad*?' },
+  { area: 4, num: 5,  msg: '¿Tiene identificadas las *fluctuaciones de demanda* por temporadas o variaciones del mercado?' },
+  { area: 4, num: 6,  msg: '¿Lleva *registro de ingresos*? (ventas, cuentas por cobrar, capital de trabajo)' },
+  { area: 4, num: 7,  msg: '¿Lleva *registros contables*? (compras, gastos, cuentas por pagar, proveedores)' },
+  { area: 4, num: 8,  msg: '¿Sabe cuánto le cuesta producir su bien o servicio? (*costos variables*)' },
+  { area: 4, num: 9,  msg: '¿*Reinvierte ganancias* para el mejoramiento de la Unidad Productiva?' },
+  { area: 4, num: 10, msg: '¿Identifica y cumple las *normas tributarias y contables*?' },
+];
+
+const DX_ESCALA = '\n\n🔢 *0* = No/Nunca · *1* = A veces/En proceso · *2* = Sí/Siempre';
+const DX_TOTAL  = DX_BASICOS.length + DX_PREGUNTAS.length; // 50
+
+// ── clasificar012: texto libre → 0, 1 o 2 (Claude) ───────
+async function clasificar012(texto) {
+  const t = texto.trim();
+  if (t === '0') return 0;
+  if (t === '1') return 1;
+  if (t === '2') return 2;
+  try {
+    const msg = await anthropic.messages.create({
+      model:      'claude-haiku-4-5-20251001',
+      max_tokens: 5,
+      messages:   [{ role: 'user', content: `Clasifica en 0=No/Nunca, 1=A veces/En proceso, 2=Sí/Siempre. Solo el número.\nRespuesta: "${texto}"` }],
+    });
+    const n = parseInt(msg.content[0].text.trim(), 10);
+    return isNaN(n) ? 0 : Math.min(2, Math.max(0, n));
+  } catch { return 0; }
+}
+
+// ── Generar Excel de Diagnóstico ──────────────────────────
+async function generarExcelDx(datos) {
+  const templatePath = path.join(__dirname, 'dx_template.xlsx');
+  const wb  = XLSX.readFile(templatePath, { cellFormula: true, cellStyles: true });
+  const wsDx  = wb.Sheets['Diagnóstico'];
+  const wsDup = wb.Sheets['Datos de la Unidad Productiva'];
+
+  function setD(ws, addr, value) {
+    if (value === null || value === undefined || value === '') return;
+    const t = typeof value === 'number' ? 'n' : 's';
+    ws[addr] = { t, v: value, w: String(value) };
+  }
+
+  const fecha = new Date().toLocaleDateString('es-CO');
+
+  // ── Hoja Diagnóstico — cabecera ──
+  setD(wsDx, 'B4', datos.dxNegocio    || '');
+  setD(wsDx, 'B5', datos.dxNombre     || '');
+  setD(wsDx, 'B7', datos.dxDinamizador || '');
+  setD(wsDx, 'B8', fecha);
+
+  // ── Hoja Diagnóstico — puntajes (col B) ──
+  const scores = datos.scores || Array(40).fill(0);
+  // Área 1: filas 11-20
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${11 + i}`, scores[i]);
+  // Área 2: filas 23-32
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${23 + i}`, scores[10 + i]);
+  // Área 3: filas 35-44
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${35 + i}`, scores[20 + i]);
+  // Área 4: filas 47-56
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${47 + i}`, scores[30 + i]);
+
+  // ── Hoja DUP — datos básicos ──
+  setD(wsDup, 'B7',  datos.dxNombre      || '');
+  setD(wsDup, 'B8',  datos.dxCedula      || '');
+  setD(wsDup, 'B10', datos.dxNegocio     || '');
+  setD(wsDup, 'B11', datos.dxCiiu        || '');
+  setD(wsDup, 'B13', datos.dxTiempo      || '');
+  setD(wsDup, 'B14', datos.dxEmpleados   || '');
+  setD(wsDup, 'B15', datos.dxDireccion   || '');
+  setD(wsDup, 'B16', datos.dxTelefono    || '');
+  setD(wsDup, 'B23', datos.dxDinamizador || '');
+
+  return wb;
+}
+
+// ── Helpers diagnóstico ───────────────────────────────────
+function getDxSesion(chatId) {
+  if (!dxSesiones.has(chatId)) {
+    dxSesiones.set(chatId, { paso: 0, datos: { scores: Array(40).fill(null) } });
+  }
+  return dxSesiones.get(chatId);
+}
+
+function dxPreguntaMsg(paso) {
+  if (paso < DX_BASICOS.length) {
+    const p = DX_BASICOS[paso];
+    return `${p.msg}\n\n_(Paso ${paso + 1} de ${DX_TOTAL})_`;
+  }
+  const qi = paso - DX_BASICOS.length;
+  const p  = DX_PREGUNTAS[qi];
+  const cambioArea = qi === 0 || DX_PREGUNTAS[qi - 1].area !== p.area;
+  const cabecera   = cambioArea ? `\n*📋 ÁREA ${p.area}*\n\n` : '';
+  return `${cabecera}*${p.area}.${p.num}* ${p.msg}${DX_ESCALA}\n\n_(Pregunta ${paso + 1} de ${DX_TOTAL})_`;
+}
+
+function dxResumenMsg(datos) {
+  const scores = datos.scores || [];
+  const s1 = scores.slice(0, 10).reduce((a, b) => a + (b || 0), 0);
+  const s2 = scores.slice(10, 20).reduce((a, b) => a + (b || 0), 0);
+  const s3 = scores.slice(20, 30).reduce((a, b) => a + (b || 0), 0);
+  const s4 = scores.slice(30, 40).reduce((a, b) => a + (b || 0), 0);
+  const total = s1 + s2 + s3 + s4;
+  const pct = (total / 80 * 100).toFixed(0);
+  const nivel = total <= 20 ? 'Inicio' : total <= 40 ? 'Básico' : total <= 60 ? 'Intermedio' : 'Avanzado';
+
+  return [
+    '📊 *Resumen del Diagnóstico*\n',
+    `👤 ${datos.dxNombre || '—'} · ${datos.dxNegocio || '—'}`,
+    '',
+    `Área 1 Legal/Adm:    *${s1}/20*`,
+    `Área 2 Comercial:    *${s2}/20*`,
+    `Área 3 Técn-Oper:    *${s3}/20*`,
+    `Área 4 Financiera:   *${s4}/20*`,
+    `─────────────────`,
+    `Total: *${total}/80* (${pct}%) → _${nivel}_`,
+    '',
+    '✅ Escribe */dx_listo* para generar el Excel oficial',
+  ].join('\n');
+}
+
+async function dxProcesarRespuesta(ctx, texto) {
+  const chatId = ctx.chat.id;
+  const sesion = getDxSesion(chatId);
+  const paso   = sesion.paso;
+
+  if (paso >= DX_TOTAL) {
+    await ctx.reply('El diagnóstico ya está completo. Usa /dx_listo para generar el Excel.');
+    return;
+  }
+
+  if (paso < DX_BASICOS.length) {
+    // Datos básicos: guardar como texto
+    sesion.datos[DX_BASICOS[paso].key] = texto;
+  } else {
+    // Pregunta diagnóstico: clasificar como 0/1/2
+    const qi    = paso - DX_BASICOS.length;
+    const score = await clasificar012(texto);
+    sesion.datos.scores[qi] = score;
+    await ctx.reply(`✅ *${score}*`, { parse_mode: 'Markdown' });
+  }
+
+  sesion.paso++;
+
+  if (sesion.paso >= DX_TOTAL) {
+    // Fin del cuestionario
+    await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
+  } else {
+    // Siguiente pregunta
+    const msg = dxPreguntaMsg(sesion.paso);
+    await ctx.reply(msg, { parse_mode: 'Markdown' });
+  }
+}
+
+// ── Comandos diagnóstico ──────────────────────────────────
+bot.command('dx', async ctx => {
+  const chatId = ctx.chat.id;
+  dxSesiones.delete(chatId);
+  await ctx.reply(
+    '🏥 *Diagnóstico Empresarial SENA*\n\n' +
+    'Vamos a evaluar 4 áreas de tu negocio con 40 preguntas.\n' +
+    'Puedes responder con voz 🎤 o escribiendo.\n\n' +
+    '*Escala:*\n' +
+    '*0* = No / Nunca / No implementado\n' +
+    '*1* = A veces / En proceso / Parcial\n' +
+    '*2* = Sí / Siempre / Completamente\n\n' +
+    '─────────────────────\n' +
+    'Primero necesito algunos datos básicos:',
+    { parse_mode: 'Markdown' }
+  );
+  const sesion = getDxSesion(chatId);
+  await ctx.reply(dxPreguntaMsg(0), { parse_mode: 'Markdown' });
+});
+
+bot.command('dx_listo', async ctx => {
+  const chatId = ctx.chat.id;
+  const sesion = dxSesiones.get(chatId);
+  if (!sesion || sesion.paso < DX_BASICOS.length) {
+    await ctx.reply('Primero completa el diagnóstico con /dx');
+    return;
+  }
+
+  await ctx.reply('📊 Generando el Excel oficial del diagnóstico… ⏳');
+
+  let wb;
+  try {
+    wb = await generarExcelDx(sesion.datos);
+  } catch (e) {
+    console.error('Error dx excel:', e.message);
+    await ctx.reply('❌ No pude generar el Excel. Revisa el archivo dx_template.xlsx en el servidor.');
+    return;
+  }
+
+  const nombre = (sesion.datos.dxNombre || 'beneficiario').replace(/\s+/g, '_');
+  const fecha  = new Date().toISOString().slice(0, 10);
+  const fn     = `Diagnostico_${nombre}_${fecha}.xlsx`;
+  const tmp    = `/tmp/${fn}`;
+  XLSX.writeFile(wb, tmp);
+
+  await ctx.replyWithDocument(new InputFile(tmp, fn), {
+    caption: [
+      '📋 *Diagnóstico Empresarial SENA*',
+      `👤 ${sesion.datos.dxNombre || ''}`,
+      `🏭 ${sesion.datos.dxNegocio || ''}`,
+      `📅 ${fecha}`,
+    ].join('\n'),
+    parse_mode: 'Markdown',
+  });
+  try { fs.unlinkSync(tmp); } catch {}
+
+  // Mostrar resumen de puntajes
+  await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
+  dxSesiones.delete(chatId);
+  await ctx.reply('✨ Listo. Usa /dx para un nuevo diagnóstico o /nuevo para el plan de negocio.');
+});
+
+bot.command('dx_resumen', async ctx => {
+  const sesion = dxSesiones.get(ctx.chat.id);
+  if (!sesion) {
+    await ctx.reply('No hay diagnóstico en curso. Usa /dx para empezar.');
+    return;
+  }
+  await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
 });
 
 // ── Health check (Render necesita puerto HTTP abierto) ────
 const PORT = process.env.PORT || 3000;
 http.createServer((_, res) => res.end('OK')).listen(PORT);
 
-console.log('🤖 Bot SENA CREAR v2 iniciando…');
+console.log('🤖 Bot SENA CREAR v3 (Plan + Diagnóstico) iniciando…');
 bot.start();
