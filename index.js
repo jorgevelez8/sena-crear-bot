@@ -369,11 +369,9 @@ async function generarExcelOficial(datos, costosFijosItems, inversionItems, comp
   set('AF116', d.prod1Unidad || '');
 
   // ── Sección 9 — Precios proyectados ──
-  // Fila 229: precios producto 1 para años 1, 2, 3
-  set('A229', d.prod1Nombre || 'Producto 1');
+  // A229 = fórmula +A116 (auto-rellena desde nombre del producto), W229/AC229 = fórmulas de inflación
+  // Solo escribimos Q229 (precio año 1); años 2 y 3 calculan solos
   set('Q229', p1);
-  set('W229', p1a2);
-  set('AC229', p1a3);
 
   // ── Sección 9 — Unidades mensuales (filas 241-252) ──
   // Col G = año 1 · Col S = año 2 · Col AE = año 3
@@ -385,36 +383,65 @@ async function generarExcelOficial(datos, costosFijosItems, inversionItems, comp
   }
 
   // ── Sección 10 — Costos fijos (filas 297-304) ──
-  // Cols: A=descripcion · T=valor mensual
+  // Cols: A=descripcion · T=valor mensual · AA=cantidad año 1 (12 meses)
+  // AE = fórmula +T*AA — NO escribir
   for (let i = 0; i < Math.min(costosFijosItems.length, 8); i++) {
     const row = 297 + i;
     const item = costosFijosItems[i];
-    set(`A${row}`, item.descripcion || '');
-    set(`T${row}`, Number(item.valorMensual) || 0);
+    set(`A${row}`,  item.descripcion || '');
+    set(`T${row}`,  Number(item.valorMensual) || 0);
+    set(`AA${row}`, 12); // 12 meses → AE auto-calcula T*AA
   }
 
   // ── Sección 10 — Costos variables producto 1 (fila 318) ──
-  // A318=descripcion · T318=costo unitario
+  // A=materia prima · K=unidad · R=valor unitario · AA=cantidad por unidad
+  // AE = fórmula +R*AA — NO escribir
   set('A318', 'Materias primas e insumos');
-  set('T318', cv1);
+  set('K318', 'Unidad');
+  set('R318', cv1); // columna R = "Valor unitario ($)" (no T)
+  set('AA318', 1);  // 1 insumo por arepa → fórmula AE318 = R318*AA318
 
   // ── Sección 10 — % Participación producto 1 (fila 349) ──
   set('Q349', 100);  // col Q para producto 1, 100% si solo hay 1 producto
 
-  // ── Sección 12 — Inversiones fijas (filas 402-421) ──
-  // Cols: A=descripcion · AA=cantidad · AD=valor · AO=aporte FE
-  for (let i = 0; i < Math.min(inversionItems.length, 8); i++) {
-    const row = 402 + i;
-    const item = inversionItems[i];
-    set(`A${row}`,  item.descripcion || '');
-    set(`AA${row}`, Number(item.cantidad) || 1);
-    set(`AD${row}`, Number(item.valor) || 0);
-  }
+  // ── Sección 12 — Inversiones fijas (filas 403-422) ──
+  // Fila 402 = encabezado. Cols input: A=descripcion · T=valor unitario · AA=cantidad
+  // AD = fórmula +T*AA · AM="X" = aporte FE · AO="X" = aporte emprendedor
+  // AE448 = fórmula SUM(AD) → NO escribir
+  // AE449 = fórmula SUMIF(AO,"X",AD) → NO escribir
+  // AE450 = fórmula AE448-AE449 → NO escribir
+  {
+    const items = inversionItems.slice(0, 19); // máx 20 filas (403-422)
+    let sumItems = items.reduce((s, it) => s + (Number(it.valor) || 0), 0);
+    // Si queda diferencia por el aporte propio no listado, ajustar último ítem
+    const diff = inv - sumItems;
 
-  // ── Sección 13 — Valor del proyecto ──
-  set('AE448', inv);
-  set('AE449', ap);
-  set('AE450', Math.max(0, inv - ap));
+    for (let i = 0; i < items.length; i++) {
+      const row  = 403 + i;
+      const item = items[i];
+      let valor  = Number(item.valor) || 0;
+      // Si es el último ítem y hay diferencia, absorberla
+      if (i === items.length - 1 && Math.abs(diff) > 0) valor += diff;
+      set(`A${row}`,  item.descripcion || '');
+      set(`T${row}`,  valor);              // Valor unitario
+      set(`AA${row}`, Number(item.cantidad) || 1);
+      set(`AM${row}`, 'X');               // Todo como aporte FE por defecto
+    }
+    // Si hay aporte propio: agregar una fila extra marcada como emprendedor
+    if (ap > 0 && items.length < 20) {
+      const rowAp = 403 + items.length;
+      set(`A${rowAp}`,  'Capital propio del emprendedor');
+      set(`T${rowAp}`,  ap);
+      set(`AA${rowAp}`, 1);
+      set(`AO${rowAp}`, 'X');  // AO = aporte emprendedor
+      // Reducir el primer ítem FE para mantener el total correcto
+      const row0 = 403;
+      const cell0 = ws[`T${row0}`];
+      if (cell0 && cell0.v) {
+        ws[`T${row0}`] = { t: 'n', v: Math.max(0, Number(cell0.v) - ap), w: String(Math.max(0, Number(cell0.v) - ap)) };
+      }
+    }
+  }
 
   // ── Sección 14 — Avances ──
   set('G459', 'En proceso');   // Legal
