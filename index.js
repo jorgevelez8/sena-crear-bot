@@ -2,11 +2,12 @@
 require('dotenv').config();
 
 const { Bot, InputFile } = require('grammy');
-const Groq  = require('groq-sdk');
-const axios = require('axios');
-const XLSX  = require('xlsx');
-const fs    = require('fs');
-const http  = require('http');
+const Groq      = require('groq-sdk');
+const axios     = require('axios');
+const XLSX      = require('xlsx');
+const fs        = require('fs');
+const path      = require('path');
+const http      = require('http');
 
 // ── Clientes API ──────────────────────────────────────────
 const bot       = new Bot(process.env.TELEGRAM_TOKEN);
@@ -14,59 +15,104 @@ const groq      = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ── Estado en memoria  chatId → { paso, datos } ──────────
+// ── Estado en memoria  chatId → { paso, datos, modo } ────
 const sesiones = new Map();
 
-// ── Preguntas del plan (orden del wizard) ─────────────────
+// ── Preguntas (~38, cubre formato oficial SENA) ───────────
 const PREGUNTAS = [
+  // === Datos del beneficiario ===
   {
     key: 'nombre',
-    msg: '¡Hola! 👋 Vamos a crear el *Plan de Negocio* paso a paso.\nPuedes responder con voz 🎤 o escribiendo.\n\n¿Cuál es el *nombre completo* del beneficiario?',
+    msg: '¡Hola! 👋 Vamos a crear el *Plan de Negocio SENA Línea CREAR*.\nPuedes responder con voz 🎤 o escribiendo.\n\n¿Cuál es el *nombre completo* del beneficiario?',
   },
-  { key: 'numDoc',         msg: '¿Cuál es el *número de cédula*?' },
-  { key: 'municipio',      msg: '¿En qué *municipio* está el proyecto?' },
-  { key: 'departamento',   msg: '¿En qué *departamento*?' },
+  { key: 'tipoDoc',       msg: '¿*Tipo de documento*?\n_(CC Cédula · CE Cédula Extranjería · PA Pasaporte · TI Tarjeta Identidad)_' },
+  { key: 'numDoc',        msg: '¿*Número de documento*?' },
+  { key: 'genero',        msg: '¿*Género*?\n_(Masculino / Femenino / Otro)_' },
+  { key: 'departamento',  msg: '¿En qué *departamento* está el proyecto?' },
+  { key: 'municipio',     msg: '¿En qué *municipio*?' },
   {
-    key: 'grupo',
-    msg: '¿A qué *grupo poblacional* pertenece?\n_(Ej: Víctima de violencia, Desplazado, Campesino, Indígena, Afrocolombiano...)_',
+    key: 'grupoPoblacional',
+    msg: '¿A qué *grupo poblacional* pertenece?\n_(Ej: Víctima de violencia, Desplazado, Campesino, Indígena, Afrocolombiano, LGBTI, Discapacidad...)_',
   },
   { key: 'nombreProyecto', msg: '¿Cuál es el *nombre del proyecto*?' },
   { key: 'tipoProyecto',   msg: '¿Es *Economía Popular* o *Economía Campesina*?' },
-  { key: 'asociativo',     msg: '¿El proyecto es *individual* o *asociativo* (varias personas)?' },
-  {
-    key: 'numPersonas',
-    msg: '¿Cuántas *personas* conforman el grupo?',
-    soloSi: d => /asoc/i.test(d.asociativo || ''),
-  },
   {
     key: 'sector',
-    msg: '¿En qué *sector* trabaja?\n_(Ej: Agricultura, Comercio, Artesanías, Turismo, Manufactura...)_',
-  },
-  { key: 'descripcion',  msg: '¿En qué *consiste el negocio*? Cuénteme con sus propias palabras.' },
-  { key: 'cliente',      msg: '¿*Quién le compra*? Describa a su cliente.' },
-  { key: 'problema',     msg: '¿Qué *problema o necesidad* resuelve su negocio?' },
-  { key: 'producto1',    msg: '¿Cuál es el *producto o servicio principal*?' },
-  { key: 'precio1',      msg: '¿A qué *precio* lo vende?\n_(Solo el número en pesos, ej: 15000)_' },
-  { key: 'unidadesMes',  msg: '¿Cuántas *unidades vende al mes* aproximadamente?\n_(Solo el número)_' },
-  {
-    key: 'costoUnit',
-    msg: '¿Cuánto le *cuesta producir* cada unidad?\n_(Materias primas e insumos — solo número)_',
+    msg: '¿En qué *sector* trabaja?\n_(Ej: Agricultura, Comercio, Artesanías, Turismo, Manufactura, Alimentos...)_',
   },
   {
-    key: 'costosFijos',
-    msg: '¿Cuánto paga de *gastos fijos al mes* en total?\n_(Arriendo, servicios, internet — solo número)_',
+    key: 'ciiu',
+    msg: '¿Cuál es la *actividad económica* (código CIIU)?\n_(Ej: 0111 Cultivo de cereales · 4711 Tienda alimentos · 1411 Confección ropa...)_',
+  },
+  { key: 'asociativo',   msg: '¿El proyecto es *asociativo* (varias personas juntas)?\n_Responda: SI o NO_' },
+  {
+    key: 'numPersonas',
+    msg: '¿*Cuántas personas* conforman el grupo asociativo?',
+    soloSi: d => /^s/i.test(d.asociativo || ''),
+    numerico: true,
+  },
+  { key: 'lugarOps', msg: '¿Ya *cuenta con un lugar de operaciones*?\n_Responda: SI o NO_' },
+
+  // === Sección 1 — Cliente ===
+  {
+    key: 'clienteCarac',
+    msg: '¿*Quién le compra*?\nDescríbame al cliente: dónde vive, estrato, edad, género, cuánto gana, si trabaja...',
   },
   {
-    key: 'inversion',
-    msg: '¿Cuánto necesita *invertir en total* para el proyecto?\n_(Maquinaria, adecuaciones, permisos — número)_',
+    key: 'clienteCual',
+    msg: '¿Cuáles son los *gustos, preferencias y cualidades* de ese cliente?\n_(Qué le gusta, qué valora, cómo decide comprar)_',
   },
+
+  // === Sección 2 — Problema ===
   {
-    key: 'aporte',
-    msg: '¿Cuánto puede *aportar usted* de esa inversión?\n_(Mínimo el 10% del total — número)_',
+    key: 'problema',
+    msg: '¿Qué *problema o necesidad* resuelve su negocio?\n¿Por qué sus clientes lo necesitan?',
   },
+
+  // === Sección 3 — Competencia ===
+  {
+    key: 'competidor1',
+    msg: '¿Quién es su *primer competidor*?\nDígame: nombre, dónde está, qué vende, a qué precio, qué ventajas tiene y qué desventajas comparado con usted.',
+  },
+  { key: 'competidor2', msg: '¿Hay un *segundo competidor*?\n_(Si no hay, diga "no hay")_' },
+  { key: 'competidor3', msg: '¿Y un *tercer competidor*?\n_(Si no hay, diga "no hay")_' },
+
+  // === Sección 4 — Descripción y propuesta de valor ===
+  { key: 'descripcion', msg: '¿En qué *consiste su proyecto*?\nCuénteme con sus propias palabras qué va a hacer y qué lo hace diferente.' },
+  { key: 'pvNuestro',   msg: 'Propuesta de valor:\n*"Nuestro producto/servicio es..."*\n_(Complete la frase: describa qué ofrece)_' },
+  { key: 'pvAyuda',     msg: '*"...que ayuda a..."*\n_(¿A quién ayuda? Tipo de persona o empresa)_' },
+  { key: 'pvQue',       msg: '*"...a que..."*\n_(¿Qué logran sus clientes con su producto?)_' },
+  { key: 'pvMediante',  msg: '*"...mediante..."*\n_(¿Cómo lo logran? ¿Qué hace diferente su negocio?)_' },
+
+  // === Sección 5 — Productos o servicios ===
+  { key: 'prod1Nombre', msg: '¿Cuál es el *nombre del producto o servicio principal*?' },
+  { key: 'prod1Desc',   msg: '¿Cómo lo *describiría*? ¿Qué es exactamente?' },
+  { key: 'prod1Unidad', msg: '¿Cuál es la *unidad de medida*?\n_(Ej: Kilogramo, Litro, Unidad, Hora, Docena, Porción...)_' },
+  { key: 'prod1Precio',      msg: '¿A qué *precio* lo vende?\n_(Número en pesos, ej: 15000 o "quince mil pesos")_', numerico: true },
+  { key: 'prod1UnidadesMes', msg: '¿Cuántas *unidades vende al mes* aproximadamente?\n_(Número)_', numerico: true },
+  { key: 'prod1Costo',       msg: '¿Cuánto le *cuesta producir* cada unidad?\n_(Materias primas e insumos — número en pesos)_', numerico: true },
+
+  // === Sección 10 — Costos fijos ===
+  {
+    key: 'costosFijosDesc',
+    msg: '¿Cuáles son sus *costos fijos mensuales*?\nCuénteme los gastos que paga todos los meses aunque no venda nada: arriendo, servicios, internet, transporte...',
+  },
+  { key: 'costosFijosTotal', msg: '¿Cuánto suman esos costos fijos *en total al mes*?\n_(Número en pesos)_', numerico: true },
+
+  // === Sección 12 — Inversión ===
+  { key: 'inversion',    msg: '¿Cuánto necesita *invertir en total*?\n_(Maquinaria, equipos, adecuaciones, materias primas iniciales — número)_', numerico: true },
+  { key: 'aportePropio', msg: '¿Cuánto puede *aportar usted* de esa inversión?\n_(Mínimo el 10% del total — número)_', numerico: true },
+  {
+    key: 'inversionDesc',
+    msg: '¿En qué va a *usar el dinero del Fondo Emprender*?\n_(Ej: máquina de coser $500.000, materias primas $300.000, adecuaciones $200.000)_',
+  },
+
+  // === Impacto ===
+  { key: 'impactoEco',    msg: '¿Cómo *beneficia económicamente* este proyecto a su comunidad o región?\n_(Empleos que genera, ingresos, encadenamientos...)_' },
+  { key: 'impactoSocial', msg: '¿Qué *impacto social* tiene el proyecto?\n_(A cuántas familias ayuda, qué cambia en su comunidad)_' },
 ];
 
-// ── Helpers ───────────────────────────────────────────────
+// ── Helpers básicos ───────────────────────────────────────
 function limpiarNombre(texto) {
   return texto
     .replace(/^(mi nombre (completo )?es|me llamo|yo me llamo|soy|yo soy|me dicen)\s+/i, '')
@@ -95,7 +141,6 @@ function maletin(n) {
   return p >= 6 ? 10000000 : p >= 4 ? 7000000 : p >= 2 ? 5000000 : 2000000;
 }
 
-// Devuelve la lista de preguntas respondidas con número de display
 function getResumenItems(sesion) {
   const items = [];
   let num = 1;
@@ -127,39 +172,112 @@ function getLastAnsweredIndex(sesion) {
   return -1;
 }
 
-// ── Plan completo con Claude ──────────────────────────────
+// ── extraerNumero: verbal → número via Claude ─────────────
+// Resuelve "un millón quinientos mil" → 1500000
+async function extraerNumero(texto) {
+  const clean = String(texto).replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+  if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean) || 0;
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 15,
+      messages: [{ role: 'user', content: `Número del texto (solo dígitos enteros, sin puntos ni comas): "${texto}"` }],
+    });
+    return Number(msg.content[0].text.replace(/[^\d]/g, '')) || 0;
+  } catch { return 0; }
+}
+
+// ── parsearCompetidor: texto libre → campos del Excel ─────
+async function parsearCompetidor(texto) {
+  if (!texto || /^no\s*hay/i.test(texto.trim())) return null;
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: `Del siguiente texto sobre un competidor extrae y responde SOLO un JSON con estos campos (strings): nombre, localizacion, producto, precio, ventajas, desventajas. Si no encuentras un campo deja "". Sin texto extra.\nTexto: "${texto}"`,
+      }],
+    });
+    const raw = msg.content[0].text.trim().replace(/```[\w]*\n?/g, '').replace(/```/g, '');
+    return JSON.parse(raw);
+  } catch {
+    return { nombre: texto.slice(0, 60), localizacion: '', producto: '', precio: '', ventajas: '', desventajas: '' };
+  }
+}
+
+// ── parsearCostosFijos: texto → lista {desc, valorMensual} ─
+async function parsearCostosFijos(texto, total) {
+  if (!texto) return [{ descripcion: 'Costos fijos', valorMensual: total }];
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: `Lista de costos fijos del texto. Solo JSON array sin texto extra:\n[{"descripcion":"...","valorMensual":0},...]\nTexto: "${texto}"\nTotal mensual: ${total}`,
+      }],
+    });
+    const raw = msg.content[0].text.trim().replace(/```[\w]*\n?/g, '').replace(/```/g, '');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [{ descripcion: texto.slice(0, 50), valorMensual: total }];
+  } catch {
+    return [{ descripcion: texto.slice(0, 60), valorMensual: total }];
+  }
+}
+
+// ── parsearInversion: texto → lista {desc, cantidad, valor} ─
+async function parsearInversion(texto, total) {
+  if (!texto) return [{ descripcion: 'Inversión', cantidad: 1, valor: total }];
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: `Lista de inversiones del texto. Solo JSON array sin texto extra:\n[{"descripcion":"...","cantidad":1,"valor":0},...]\nTexto: "${texto}"\nTotal: ${total}`,
+      }],
+    });
+    const raw = msg.content[0].text.trim().replace(/```[\w]*\n?/g, '').replace(/```/g, '');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [{ descripcion: texto.slice(0, 50), cantidad: 1, valor: total }];
+  } catch {
+    return [{ descripcion: texto.slice(0, 60), cantidad: 1, valor: total }];
+  }
+}
+
+// ── Generar Plan Narrativo con Claude ─────────────────────
 async function generarPlanCompleto(datos) {
-  const p   = Number(datos.precio1)     || 0;
-  const u   = Number(datos.unidadesMes) || 0;
-  const cv  = Number(datos.costoUnit)   || 0;
-  const cf  = Number(datos.costosFijos) || 0;
-  const inv = Number(datos.inversion)   || 0;
-  const ap  = Number(datos.aporte)      || 0;
-  const np  = Number(datos.numPersonas) || 1;
+  const d = datos;
+  const p   = Number(d.prod1Precio)     || 0;
+  const u   = Number(d.prod1UnidadesMes) || 0;
+  const cv  = Number(d.prod1Costo)       || 0;
+  const cf  = Number(d.costosFijosTotal) || 0;
+  const inv = Number(d.inversion)        || 0;
+  const ap  = Number(d.aportePropio)     || 0;
+  const np  = Number(d.numPersonas)      || 1;
 
   const prompt = `Eres un asesor del SENA Colombia experto en planes de negocio para la Línea CREAR Especial (víctimas del conflicto, campesinos, desplazados). Redacta en español claro, formal y empático. Máximo 200 palabras por sección. Responde SOLO con el JSON sin texto adicional ni bloques de código.
 
 DATOS DEL BENEFICIARIO:
-- Nombre: ${datos.nombre} | Grupo: ${datos.grupo}
-- Ubicación: ${datos.municipio}, ${datos.departamento}
-- Proyecto: ${datos.nombreProyecto} (${datos.tipoProyecto} · ${datos.sector})
-- Modalidad: ${/asoc/i.test(datos.asociativo || '') ? `Asociativo — ${np} personas` : 'Individual'}
-- Negocio: ${datos.descripcion}
-- Producto/servicio: ${datos.producto1} a $${p.toLocaleString('es-CO')} · ${u} unidades/mes
-- Cliente objetivo: ${datos.cliente}
-- Problema que resuelve: ${datos.problema}
+- Nombre: ${d.nombre} (${d.tipoDoc} ${d.numDoc}) — ${d.genero}
+- Grupo: ${d.grupoPoblacional}
+- Ubicación: ${d.municipio}, ${d.departamento}
+- Proyecto: ${d.nombreProyecto} (${d.tipoProyecto} · ${d.sector} · CIIU: ${d.ciiu})
+- Modalidad: ${/^s/i.test(d.asociativo || '') ? `Asociativo ${np} personas` : 'Individual'}
+- Descripción: ${d.descripcion}
+- Propuesta de valor: Nuestro ${d.pvNuestro} ayuda a ${d.pvAyuda} a que ${d.pvQue} mediante ${d.pvMediante}
+- Producto: ${d.prod1Nombre} (${d.prod1Unidad}) · Precio: $${p.toLocaleString('es-CO')} · ${u} unidades/mes
+- Cliente: ${d.clienteCarac}
+- Problema que resuelve: ${d.problema}
+- Competidor 1: ${d.competidor1 || 'no especificado'}
 - Costo unitario: $${cv.toLocaleString('es-CO')} · Costos fijos: $${cf.toLocaleString('es-CO')}/mes
 - Inversión total: $${inv.toLocaleString('es-CO')} · Aporte propio: $${ap.toLocaleString('es-CO')}
+- Uso del dinero: ${d.inversionDesc}
+- Impacto económico: ${d.impactoEco}
+- Impacto social: ${d.impactoSocial}
 
-{
-  "descripcionNegocio": "Narrativa del negocio: propuesta de valor, origen y contexto del emprendedor.",
-  "mercadoObjetivo": "Perfil del cliente ideal, frecuencia de compra, tamaño de mercado local estimado.",
-  "analisisCompetencia": "Competidores directos e indirectos en la zona. Ventajas diferenciales del proyecto.",
-  "estrategiaComercial": "Canales de venta, estrategia de precios, promoción y fidelización de clientes.",
-  "planOperativo": "Proceso productivo paso a paso, proveedores clave, capacidad instalada y horarios.",
-  "analisisRiesgos": "3 riesgos principales con probabilidad, impacto y plan de mitigación para cada uno.",
-  "justificacionInversion": "Desglose de la inversión por rubro (maquinaria, insumos, adecuaciones, capital de trabajo) con justificación de cada uno."
-}`;
+{"descripcionNegocio":"...","mercadoObjetivo":"...","analisisCompetencia":"...","estrategiaComercial":"...","planOperativo":"...","analisisRiesgos":"...","justificacionInversion":"..."}`;
 
   const msg = await anthropic.messages.create({
     model:      'claude-haiku-4-5-20251001',
@@ -170,6 +288,143 @@ DATOS DEL BENEFICIARIO:
   const raw = msg.content[0].text.trim()
     .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
   return JSON.parse(raw);
+}
+
+// ── Llenar Excel oficial SENA ─────────────────────────────
+async function generarExcelOficial(datos, costosFijosItems, inversionItems, comps) {
+  const templatePath = path.join(__dirname, 'template.xlsx');
+  const wb = XLSX.readFile(templatePath, { cellFormula: true, cellStyles: true });
+  const ws = wb.Sheets['PROYECTO'];
+
+  // Escribe en la celda top-left de cada merge (preserva merges y estilos)
+  function set(addr, value) {
+    if (value === null || value === undefined || value === '') return;
+    const t = typeof value === 'number' ? 'n' : 's';
+    ws[addr] = { t, v: value, w: String(value) };
+  }
+
+  const d = datos;
+  const p1   = Number(d.prod1Precio)     || 0;
+  const u1   = Number(d.prod1UnidadesMes) || 0;
+  const cv1  = Number(d.prod1Costo)       || 0;
+  const cf   = Number(d.costosFijosTotal) || 0;
+  const inv  = Number(d.inversion)        || 0;
+  const ap   = Number(d.aportePropio)     || 0;
+  const np   = Number(d.numPersonas)      || 1;
+
+  // Precios años 2 y 3 (+4% y +8%)
+  const p1a2 = Math.round(p1 * 1.04);
+  const p1a3 = Math.round(p1 * 1.08);
+  // Unidades años 2 y 3 (+10% y +20%)
+  const u1a2 = Math.round(u1 * 1.10);
+  const u1a3 = Math.round(u1 * 1.20);
+
+  // ── Datos básicos ──
+  set('B10', d.nombre || '');
+  set('T10', d.tipoDoc || 'CC');
+  set('AC10', d.numDoc || '');
+  set('B14', d.nombreProyecto || '');
+  set('T14', d.departamento || '');
+  set('AC14', d.municipio || '');
+  set('B18', d.tipoProyecto || '');
+  set('L18', d.sector || '');
+  set('Z18', d.ciiu || '');
+  set('R21', /^s/i.test(d.asociativo || '') ? 'SI' : 'NO');
+  if (/^s/i.test(d.asociativo || '')) set('AN21', np);
+  set('R23', /^s/i.test(d.lugarOps || '') ? 'SI' : 'NO');
+
+  // ── Sección 1 — Cliente ──
+  set('A61', d.clienteCarac || '');
+  set('S61', d.clienteCual || '');
+
+  // ── Sección 2 — Problema ──
+  set('A77', d.problema || '');
+
+  // ── Sección 3 — Competidores ──
+  // Filas 94, 95, 96 · cols: A(nombre) I(loc) R(prod) X(precio) AC(ventajas) AK(desventajas)
+  for (let i = 0; i < 3; i++) {
+    const comp = comps[i];
+    if (!comp) continue;
+    const r = 94 + i;
+    set(`A${r}`, comp.nombre || '');
+    set(`I${r}`, comp.localizacion || '');
+    set(`R${r}`, comp.producto || '');
+    set(`X${r}`, comp.precio || '');
+    set(`AC${r}`, comp.ventajas || '');
+    set(`AK${r}`, comp.desventajas || '');
+  }
+
+  // ── Sección 4 — Descripción y propuesta de valor ──
+  set('I102', d.descripcion || '');
+  set('G105', d.pvNuestro || '');
+  set('G106', d.pvAyuda || '');
+  set('G107', d.pvQue || '');
+  set('G108', d.pvMediante || '');
+
+  // ── Sección 5 — Productos ──
+  // Tabla de nombres (fila 116)
+  set('A116', d.prod1Nombre || '');
+  set('K116', d.prod1Desc || '');
+  set('Y116', d.prod1Unidad || '');
+  set('AF116', d.prod1Unidad || '');
+
+  // ── Sección 9 — Precios proyectados ──
+  // Fila 229: precios producto 1 para años 1, 2, 3
+  set('A229', d.prod1Nombre || 'Producto 1');
+  set('Q229', p1);
+  set('W229', p1a2);
+  set('AC229', p1a3);
+
+  // ── Sección 9 — Unidades mensuales (filas 241-252) ──
+  // Col G = año 1 · Col S = año 2 · Col AE = año 3
+  for (let mes = 0; mes < 12; mes++) {
+    const row = 241 + mes;
+    set(`G${row}`, u1);
+    set(`S${row}`, u1a2);
+    set(`AE${row}`, u1a3);
+  }
+
+  // ── Sección 10 — Costos fijos (filas 297-304) ──
+  // Cols: A=descripcion · T=valor mensual
+  for (let i = 0; i < Math.min(costosFijosItems.length, 8); i++) {
+    const row = 297 + i;
+    const item = costosFijosItems[i];
+    set(`A${row}`, item.descripcion || '');
+    set(`T${row}`, Number(item.valorMensual) || 0);
+  }
+
+  // ── Sección 10 — Costos variables producto 1 (fila 318) ──
+  // A318=descripcion · T318=costo unitario
+  set('A318', 'Materias primas e insumos');
+  set('T318', cv1);
+
+  // ── Sección 10 — % Participación producto 1 (fila 349) ──
+  set('Q349', 100);  // col Q para producto 1, 100% si solo hay 1 producto
+
+  // ── Sección 12 — Inversiones fijas (filas 402-421) ──
+  // Cols: A=descripcion · AA=cantidad · AD=valor · AO=aporte FE
+  for (let i = 0; i < Math.min(inversionItems.length, 8); i++) {
+    const row = 402 + i;
+    const item = inversionItems[i];
+    set(`A${row}`,  item.descripcion || '');
+    set(`AA${row}`, Number(item.cantidad) || 1);
+    set(`AD${row}`, Number(item.valor) || 0);
+  }
+
+  // ── Sección 13 — Valor del proyecto ──
+  set('AE448', inv);
+  set('AE449', ap);
+  set('AE450', Math.max(0, inv - ap));
+
+  // ── Sección 14 — Avances ──
+  set('G459', 'En proceso');   // Legal
+  set('G460', 'Identificado'); // Comercial
+
+  // ── Sección 16 — Impacto ──
+  set('K487', d.impactoEco    || '');
+  set('K489', d.impactoSocial || '');
+
+  return wb;
 }
 
 // ── Transcripción Groq Whisper ────────────────────────────
@@ -193,95 +448,150 @@ async function transcribir(fileId) {
   }
 }
 
-// ── Generar Excel ─────────────────────────────────────────
-function generarExcel(datos, planIA = null) {
-  const p   = Number(datos.precio1)     || 0;
-  const u   = Number(datos.unidadesMes) || 0;
-  const cv  = Number(datos.costoUnit)   || 0;
-  const cf  = Number(datos.costosFijos) || 0;
-  const inv = Number(datos.inversion)   || 0;
-  const ap  = Number(datos.aporte)      || 0;
-  const np  = Number(datos.numPersonas) || 1;
+// ── Finalizar: generar Excels y enviar ───────────────────
+async function finalizar(ctx, sesion) {
+  await ctx.reply('🎉 *¡Plan completado!* Procesando con IA… ⏳\n_Esto puede tardar 30-60 segundos._', { parse_mode: 'Markdown' });
 
-  const ven1   = p * u * 12;
-  const ven2   = Math.round(p * 1.04 * (u * 1.1) * 12);
-  const ven3   = Math.round(p * 1.08 * (u * 1.2) * 12);
-  const cv1    = cv * u * 12;
-  const cf1    = cf * 12;
-  const margen = ven1 - cv1;
-  const ebitda = margen - cf1;
-  const mc     = p > 0 ? (p - cv) / p : 0;
-  const ptoEq  = mc > 0 ? Math.ceil(cf1 / (mc * p)) : 0;
-  const fe     = Math.max(0, inv - ap);
-  const apPct  = inv > 0 ? (ap / inv * 100) : 0;
-  const kit    = maletin(np);
+  const d = sesion.datos;
+  const p   = Number(d.prod1Precio)     || 0;
+  const u   = Number(d.prod1UnidadesMes) || 0;
+  const cv  = Number(d.prod1Costo)       || 0;
+  const cf  = Number(d.costosFijosTotal) || 0;
+  const inv = Number(d.inversion)        || 0;
+  const ap  = Number(d.aportePropio)     || 0;
+  const np  = Number(d.numPersonas)      || 1;
 
-  const wb = XLSX.utils.book_new();
-
-  // Hoja 1 — Proyecto
-  const ws1 = XLSX.utils.aoa_to_sheet([
-    ['PLAN DE NEGOCIO — SENA LÍNEA CREAR ESPECIAL'],
-    ['Generado por bot de voz · ' + new Date().toLocaleDateString('es-CO')],
-    [],
-    ['INFORMACIÓN DEL BENEFICIARIO'],
-    ['Nombre completo',     datos.nombre        || ''],
-    ['Número de cédula',    datos.numDoc        || ''],
-    ['Municipio',           datos.municipio     || ''],
-    ['Departamento',        datos.departamento  || ''],
-    ['Grupo poblacional',   datos.grupo         || ''],
-    [],
-    ['INFORMACIÓN DEL PROYECTO'],
-    ['Nombre del proyecto', datos.nombreProyecto || ''],
-    ['Tipo de proyecto',    datos.tipoProyecto  || ''],
-    ['Sector / Actividad',  datos.sector        || ''],
-    ['¿Asociativo?',        datos.asociativo    || 'Individual'],
-    ['Número de personas',  np],
-    ['Maletín de formación', fmt(kit)],
-    [],
-    ['COMPONENTE COMERCIAL'],
-    ['Descripción del negocio',      datos.descripcion || ''],
-    ['Cliente objetivo',             datos.cliente     || ''],
-    ['Problema que resuelve',        datos.problema    || ''],
-    ['Producto / servicio principal', datos.producto1  || ''],
+  // 1. Parsear competidores, costos e inversión en paralelo
+  const [comp1, comp2, comp3, costosFijosItems, inversionItems] = await Promise.all([
+    parsearCompetidor(d.competidor1),
+    parsearCompetidor(d.competidor2),
+    parsearCompetidor(d.competidor3),
+    parsearCostosFijos(d.costosFijosDesc, cf),
+    parsearInversion(d.inversionDesc, inv),
   ]);
-  ws1['!cols'] = [{ wch: 30 }, { wch: 65 }];
-  XLSX.utils.book_append_sheet(wb, ws1, 'PROYECTO');
+  const comps = [comp1, comp2, comp3];
 
-  // Hoja 2 — Modelo Financiero
-  const ws2 = XLSX.utils.aoa_to_sheet([
-    ['MODELO FINANCIERO — LÍNEA CREAR'],
-    [],
-    ['VENTAS'],
-    ['Producto',                        datos.producto1 || ''],
-    ['Precio unitario (Año 1)',          p],
-    ['Unidades / mes',                  u],
-    ['Ventas Año 1',                    ven1],
-    ['Ventas Año 2 (+4% precio, +10% cant.)', ven2],
-    ['Ventas Año 3 (+8% precio, +20% cant.)', ven3],
-    [],
-    ['COSTOS'],
-    ['Costo variable por unidad',       cv],
-    ['Total costos variables Año 1',    cv1],
-    ['Costos fijos mensuales',          cf],
-    ['Total costos fijos Año 1',        cf1],
-    [],
-    ['RESULTADOS'],
-    ['Margen bruto Año 1',              margen],
-    ['EBITDA Año 1',                    ebitda],
-    ['Punto de equilibrio (unid./año)', ptoEq],
-    [],
-    ['INVERSIÓN Y FONDO EMPRENDER'],
-    ['Inversión total requerida',       inv],
-    ['Aporte del emprendedor',          ap],
-    ['% de aporte',                     apPct.toFixed(1) + '%  ' + (apPct >= 10 ? '✓ CUMPLE' : '✗ NO CUMPLE (mín. 10%)')],
-    ['Solicitado al Fondo Emprender',   fe],
-    ['Maletín de formación',            kit],
-  ]);
-  ws2['!cols'] = [{ wch: 42 }, { wch: 22 }];
-  XLSX.utils.book_append_sheet(wb, ws2, 'MODELO FINANCIERO');
+  // 2. Generar plan narrativo
+  let planIA = null;
+  try {
+    planIA = await generarPlanCompleto(d);
+  } catch (e) {
+    console.error('Claude plan error:', e.message);
+    await ctx.reply('⚠️ No pude generar las secciones narrativas, pero el Excel oficial sí va a salir.');
+  }
 
-  // Hoja 3 — Plan narrativo generado por IA (solo si Claude respondió)
+  // 3. Llenar Excel oficial SENA
+  const fecha  = new Date().toISOString().slice(0, 10);
+  const nombre = (d.nombre || 'beneficiario').replace(/\s+/g, '_');
+
+  let wbOficial;
+  try {
+    wbOficial = await generarExcelOficial(d, costosFijosItems, inversionItems, comps);
+  } catch (e) {
+    console.error('Excel oficial error:', e.message);
+    await ctx.reply('❌ No pude generar el Excel oficial SENA. Revisa el template.xlsx en el servidor.');
+    return;
+  }
+
+  const fnOficial = `PROYECTO_CREAR_${nombre}_${fecha}.xlsx`;
+  const tmpOficial = `/tmp/${fnOficial}`;
+  XLSX.writeFile(wbOficial, tmpOficial);
+
+  await ctx.replyWithDocument(new InputFile(tmpOficial, fnOficial), {
+    caption: [
+      '📊 *Excel Oficial SENA — Línea CREAR Especial*',
+      `👤 ${d.nombre || ''}`,
+      `🏭 ${d.nombreProyecto || ''}`,
+      `📅 ${fecha}`,
+      '',
+      '_Abrir en Excel para ver fórmulas del Modelo Financiero_',
+    ].join('\n'),
+    parse_mode: 'Markdown',
+  });
+  try { fs.unlinkSync(tmpOficial); } catch {}
+
+  // 4. Si hay plan narrativo, enviar también el plan completo
   if (planIA) {
+    const ven1 = p * u * 12;
+    const ven2 = Math.round(p * 1.04 * (u * 1.1) * 12);
+    const ven3 = Math.round(p * 1.08 * (u * 1.2) * 12);
+    const mc   = p > 0 ? (p - cv) / p : 0;
+    const cf12 = cf * 12;
+    const ptoEq = mc > 0 ? Math.ceil(cf12 / (mc * p)) : 0;
+    const fe    = Math.max(0, inv - ap);
+    const apPct = inv > 0 ? (ap / inv * 100) : 0;
+    const kit   = maletin(np);
+
+    const wb2 = XLSX.utils.book_new();
+
+    // Hoja 1 — Datos del beneficiario
+    const ws1 = XLSX.utils.aoa_to_sheet([
+      ['PLAN DE NEGOCIO — SENA LÍNEA CREAR ESPECIAL'],
+      ['Bot de voz · ' + fecha],
+      [],
+      ['BENEFICIARIO'],
+      ['Nombre completo',     d.nombre        || ''],
+      ['Tipo / N° documento', (d.tipoDoc || 'CC') + ' ' + (d.numDoc || '')],
+      ['Género',              d.genero        || ''],
+      ['Municipio',           d.municipio     || ''],
+      ['Departamento',        d.departamento  || ''],
+      ['Grupo poblacional',   d.grupoPoblacional || ''],
+      [],
+      ['PROYECTO'],
+      ['Nombre del proyecto', d.nombreProyecto || ''],
+      ['Tipo de proyecto',    d.tipoProyecto  || ''],
+      ['Sector / CIIU',       (d.sector || '') + ' · ' + (d.ciiu || '')],
+      ['Modalidad',           /^s/i.test(d.asociativo || '') ? `Asociativo ${np} personas` : 'Individual'],
+      ['Maletín de formación', fmt(kit)],
+      ['Lugar de operaciones', /^s/i.test(d.lugarOps || '') ? 'SÍ' : 'NO'],
+      [],
+      ['PROPUESTA DE VALOR'],
+      ['Descripción',         d.descripcion || ''],
+      ['Nuestro:',            d.pvNuestro   || ''],
+      ['Ayuda a:',            d.pvAyuda     || ''],
+      ['A que:',              d.pvQue       || ''],
+      ['Mediante:',           d.pvMediante  || ''],
+      [],
+      ['PRODUCTO PRINCIPAL'],
+      ['Nombre',       d.prod1Nombre || ''],
+      ['Descripción',  d.prod1Desc   || ''],
+      ['Unidad',       d.prod1Unidad || ''],
+    ]);
+    ws1['!cols'] = [{ wch: 28 }, { wch: 65 }];
+    XLSX.utils.book_append_sheet(wb2, ws1, 'DATOS');
+
+    // Hoja 2 — Modelo financiero
+    const ws2 = XLSX.utils.aoa_to_sheet([
+      ['MODELO FINANCIERO'],
+      [],
+      ['VENTAS'],
+      ['Producto',                          d.prod1Nombre || ''],
+      ['Precio Año 1',                      p],
+      ['Unidades/mes',                      u],
+      ['Ventas Año 1',                      ven1],
+      ['Ventas Año 2 (+4% precio +10% u.)', ven2],
+      ['Ventas Año 3 (+8% precio +20% u.)', ven3],
+      [],
+      ['COSTOS'],
+      ['Costo variable/unidad',             cv],
+      ['Costos fijos/mes',                  cf],
+      [],
+      ['RESULTADOS AÑO 1'],
+      ['Margen bruto',                      ven1 - cv * u * 12],
+      ['EBITDA',                            ven1 - cv * u * 12 - cf12],
+      ['Punto de equilibrio (unid./año)',   ptoEq],
+      [],
+      ['INVERSIÓN Y FONDO EMPRENDER'],
+      ['Inversión total',                   inv],
+      ['Aporte emprendedor',                ap],
+      ['% Aporte',                          apPct.toFixed(1) + '% ' + (apPct >= 10 ? '✓ CUMPLE' : '✗ NO CUMPLE (mín. 10%)')],
+      ['Solicitado al Fondo Emprender',     fe],
+      ['Maletín de formación',              kit],
+    ]);
+    ws2['!cols'] = [{ wch: 40 }, { wch: 22 }];
+    XLSX.utils.book_append_sheet(wb2, ws2, 'MODELO FINANCIERO');
+
+    // Hoja 3 — Plan narrativo
     const secciones = [
       ['DESCRIPCIÓN DEL NEGOCIO',     planIA.descripcionNegocio],
       ['MERCADO OBJETIVO',             planIA.mercadoObjetivo],
@@ -291,11 +601,7 @@ function generarExcel(datos, planIA = null) {
       ['ANÁLISIS DE RIESGOS',          planIA.analisisRiesgos],
       ['JUSTIFICACIÓN DE LA INVERSIÓN', planIA.justificacionInversion],
     ];
-    const filas = [
-      ['PLAN DE NEGOCIO COMPLETO — SENA LÍNEA CREAR ESPECIAL'],
-      ['Generado con IA · ' + new Date().toLocaleDateString('es-CO')],
-      [],
-    ];
+    const filas = [['PLAN NARRATIVO — SENA LÍNEA CREAR'], ['Generado con IA · ' + fecha], []];
     for (const [titulo, contenido] of secciones) {
       filas.push([titulo]);
       filas.push([contenido || '']);
@@ -303,13 +609,22 @@ function generarExcel(datos, planIA = null) {
     }
     const ws3 = XLSX.utils.aoa_to_sheet(filas);
     ws3['!cols'] = [{ wch: 120 }];
-    XLSX.utils.book_append_sheet(wb, ws3, 'PLAN NARRATIVO');
+    XLSX.utils.book_append_sheet(wb2, ws3, 'PLAN NARRATIVO');
+
+    const fnPlan = `PlanNarrado_${nombre}_${fecha}.xlsx`;
+    const tmpPlan = `/tmp/${fnPlan}`;
+    XLSX.writeFile(wb2, tmpPlan);
+    await ctx.replyWithDocument(new InputFile(tmpPlan, fnPlan), {
+      caption: '📝 *Plan Narrativo + Modelo Financiero*\n_Secciones redactadas por IA para el expediente_',
+      parse_mode: 'Markdown',
+    });
+    try { fs.unlinkSync(tmpPlan); } catch {}
   }
 
-  return wb;
+  await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario.');
 }
 
-// ── Procesar respuesta y avanzar al siguiente paso ────────
+// ── Procesar respuesta y avanzar ──────────────────────────
 async function procesarRespuesta(ctx, texto) {
   const chatId = ctx.chat.id;
   const sesion = getSesion(chatId);
@@ -317,15 +632,19 @@ async function procesarRespuesta(ctx, texto) {
   if (!actual) return;
 
   const { p, i } = actual;
-  const valor = p.key === 'nombre' ? limpiarNombre(texto) : texto;
+  let valor = p.key === 'nombre' ? limpiarNombre(texto) : texto;
+
+  // Campos numéricos: parsear números verbales con Claude
+  if (p.numerico) {
+    valor = String(await extraerNumero(texto));
+  }
+
   sesion.datos[p.key] = valor;
   sesion.paso = i + 1;
 
-  // Confirmación
   const preview = valor.length > 120 ? valor.slice(0, 120) + '…' : valor;
   await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
 
-  // Siguiente pregunta o pasar a revisión
   const sig = getPregunta(sesion.paso, sesion.datos);
   if (sig) {
     const progreso = `_(${sesion.paso}/${PREGUNTAS.length})_`;
@@ -336,47 +655,12 @@ async function procesarRespuesta(ctx, texto) {
   }
 }
 
-// ── Finalizar: generar y enviar Excel ────────────────────
-async function finalizar(ctx, sesion) {
-  await ctx.reply('🎉 *¡Plan completado!* Generando el plan de negocio con IA… ⏳', { parse_mode: 'Markdown' });
-
-  let planIA = null;
-  try {
-    planIA = await generarPlanCompleto(sesion.datos);
-  } catch (e) {
-    console.error('Claude API error:', e.message);
-    await ctx.reply('⚠️ No pude generar las secciones narrativas, pero el Excel con los datos está listo.');
-  }
-
-  const wb     = generarExcel(sesion.datos, planIA);
-  const nombre = (sesion.datos.nombre || 'beneficiario').replace(/\s+/g, '_');
-  const fecha  = new Date().toISOString().slice(0, 10);
-  const fn     = `PlanNegocio_${nombre}_${fecha}.xlsx`;
-  const tmp    = `/tmp/${fn}`;
-
-  XLSX.writeFile(wb, tmp);
-
-  await ctx.replyWithDocument(new InputFile(tmp, fn), {
-    caption: [
-      '📊 *Plan de Negocio SENA Línea CREAR*',
-      `👤 ${sesion.datos.nombre || ''}`,
-      `🏭 ${sesion.datos.nombreProyecto || ''}`,
-      `📅 ${fecha}`,
-    ].join('\n'),
-    parse_mode: 'Markdown',
-  });
-
-  try { fs.unlinkSync(tmp); } catch {}
-
-  await ctx.reply('✨ Listo. Usa /nuevo para registrar el siguiente beneficiario.');
-}
-
 // ── Comandos ──────────────────────────────────────────────
 bot.command('start', async ctx => {
   sesiones.delete(ctx.chat.id);
   await ctx.reply(
-    '👋 *Bienvenido al Bot SENA · Línea CREAR*\n\n' +
-    'Te voy a guiar para crear el *Plan de Negocio* paso a paso.\n' +
+    '👋 *Bienvenido al Bot SENA · Línea CREAR Especial*\n\n' +
+    'Te voy a guiar para crear el *Plan de Negocio* oficial paso a paso.\n' +
     'Puedes responder con voz 🎤 o escribiendo ✍️\n\n' +
     '↩️ /atras — Corregir la respuesta anterior\n' +
     '📋 /resumen — Ver y corregir todas las respuestas\n' +
@@ -472,10 +756,12 @@ bot.command('estado', async ctx => {
   );
 });
 
-// ── Guardar corrección (modo corrigiendo) ─────────────────
+// ── Corrección desde resumen ──────────────────────────────
 async function aplicarCorreccion(ctx, sesion, texto) {
   const key   = sesion.corrigiendoKey;
-  const valor = key === 'nombre' ? limpiarNombre(texto) : texto;
+  const p     = PREGUNTAS.find(q => q.key === key);
+  let valor   = key === 'nombre' ? limpiarNombre(texto) : texto;
+  if (p && p.numerico) valor = String(await extraerNumero(texto));
   sesion.datos[key] = valor;
   sesion.modo = 'revisando';
   const preview = valor.length > 80 ? valor.slice(0, 80) + '…' : valor;
@@ -485,10 +771,10 @@ async function aplicarCorreccion(ctx, sesion, texto) {
 
 // ── Mensajes de voz / audio ───────────────────────────────
 bot.on(['message:voice', 'message:audio'], async ctx => {
-  const sesion    = getSesion(ctx.chat.id);
-  const enRevision = sesion.modo === 'revisando';
+  const sesion       = getSesion(ctx.chat.id);
+  const enRevision   = sesion.modo === 'revisando';
   const enCorreccion = sesion.modo === 'corrigiendo';
-  const actual    = getPregunta(sesion.paso, sesion.datos);
+  const actual       = getPregunta(sesion.paso, sesion.datos);
 
   if (!actual && !enCorreccion) {
     await ctx.reply(enRevision
@@ -520,7 +806,6 @@ bot.on('message:text', async ctx => {
   const chatId = ctx.chat.id;
   const sesion = getSesion(chatId);
 
-  // Modo revisando: espera número de pregunta
   if (sesion.modo === 'revisando') {
     const n = parseInt(ctx.message.text.trim(), 10);
     if (!isNaN(n) && n >= 1) {
@@ -543,13 +828,11 @@ bot.on('message:text', async ctx => {
     return;
   }
 
-  // Modo corrigiendo: guarda texto y vuelve al resumen
   if (sesion.modo === 'corrigiendo') {
     await aplicarCorreccion(ctx, sesion, ctx.message.text);
     return;
   }
 
-  // Flujo normal
   const actual = getPregunta(sesion.paso, sesion.datos);
   if (!actual) {
     await ctx.reply('Usa /nuevo para iniciar un plan.');
@@ -558,10 +841,9 @@ bot.on('message:text', async ctx => {
   await procesarRespuesta(ctx, ctx.message.text);
 });
 
-// ── Health check (Render necesita un puerto HTTP abierto) ─
+// ── Health check (Render necesita puerto HTTP abierto) ────
 const PORT = process.env.PORT || 3000;
 http.createServer((_, res) => res.end('OK')).listen(PORT);
 
-// ── Arranque ──────────────────────────────────────────────
-console.log('🤖 Bot SENA CREAR iniciando…');
+console.log('🤖 Bot SENA CREAR v2 iniciando…');
 bot.start();
