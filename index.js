@@ -228,8 +228,8 @@ const CLAVES_OPCIONALES = new Set([
   'lugarOps', 'clienteCual', 'competidor2', 'competidor3',
   'pvNuestro', 'pvAyuda', 'pvQue', 'pvMediante',
   'prod1Desc', 'prod1Unidad',
-  'costosFijosDesc', 'manoObraTotal', 'gastosAdmin', 'permisosTotal',
-  // costosFijosTotal NO es opcional — sin ese número el modelo financiero queda vacío
+  'costosFijosDesc', 'gastosAdmin', 'permisosTotal',
+  // manoObraTotal y costosFijosTotal NO son opcionales — alimentan D16/D17 del MODELO FINANCIERO
   'impactoEco', 'impactoSocial',
 ]);
 
@@ -817,16 +817,20 @@ async function finalizar(ctx, sesion) {
     try { fs.unlinkSync(tmpPlan); } catch {}
   }
 
-  await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario o /retomar + cédula para editar este plan.');
-
-  // FIX 4: guardar plan completo en Redis por cédula (7 días)
-  const numDoc = datos.numDoc;
-  if (numDoc && _redis) {
+  // Guardar plan con PIN — accesible desde cualquier chat con el PIN
+  if (_redis) {
     try {
-      // Llave incluye chatId: solo el chat que generó el plan puede retomarlo
-      await _redis.setex(`plan:chat:${ctx.chat.id}:${numDoc}`, 7 * 24 * 3600, JSON.stringify(datos));
-    } catch (e) { console.error('redis save plan cedula:', e.message); }
+      const pin = String(Math.floor(1000 + Math.random() * 9000));
+      await _redis.setex(`plan:pin:${pin}`, 30 * 24 * 3600, JSON.stringify(datos));
+      await ctx.reply(
+        `🔑 *PIN para retomar este plan:* \`${pin}\`\n\n` +
+        '_Guárdalo. Cualquier dinamizador puede usarlo en /retomar para corregir observaciones de SENA (válido 30 días)._',
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) { console.error('redis save plan pin:', e.message); }
   }
+
+  await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario.');
 }
 
 // ══════════════════════════════════════════════════════════
@@ -932,6 +936,61 @@ async function aplicarCorreccion(ctx, sesion, chatId, texto) {
 }
 
 // ══════════════════════════════════════════════════════════
+// ── HANDLERS COMPARTIDOS TEXTO + VOZ ─────────────────────
+// ══════════════════════════════════════════════════════════
+
+async function manejarConfirmacionViabilidad(ctx, texto) {
+  const chatId = ctx.chat.id;
+  const sesion = await getSesion(chatId);
+  sesion.modo  = 'revisando';
+  await setSesion(chatId, sesion);
+  if (/^(continuar|si|sí|generar|ok|dale)$/i.test(texto.trim())) {
+    await ctx.reply('Generando el plan con los datos actuales…');
+    await finalizar(ctx, sesion);
+    await delSesion(chatId);
+  } else {
+    await ctx.reply('Volviste al resumen. Corrige los datos y vuelve a escribir /listo.');
+    await mostrarResumen(ctx, sesion);
+  }
+}
+
+async function manejarPinRetomar(ctx, texto) {
+  const chatId = ctx.chat.id;
+  const sesion = await getSesion(chatId);
+  const pin    = texto.trim().replace(/\D/g, '');
+
+  if (!pin || pin.length !== 4) {
+    await ctx.reply('Escribe el *PIN de 4 dígitos* que recibiste al generar el plan.', { parse_mode: 'Markdown' });
+    return;
+  }
+
+  let datosGuardados = null;
+  if (_redis) {
+    try {
+      const raw = await _redis.get(`plan:pin:${pin}`);
+      if (raw) datosGuardados = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch (e) { console.error('redis get pin:', e.message); }
+  }
+
+  if (!datosGuardados) {
+    await ctx.reply(
+      `PIN *${pin}* no encontrado o expirado.\n\nLos planes se guardan 30 días. Si pasó más tiempo, usa /nuevo para empezar de cero.`,
+      { parse_mode: 'Markdown' }
+    );
+    sesion.modo = undefined;
+    await setSesion(chatId, sesion);
+    return;
+  }
+
+  sesion.datos = datosGuardados;
+  sesion.paso  = PREGUNTAS.length;
+  sesion.modo  = 'revisando';
+  await setSesion(chatId, sesion);
+  await ctx.reply(`✅ Plan de *${datosGuardados.nombre || 'beneficiario'}* cargado.`, { parse_mode: 'Markdown' });
+  await mostrarResumen(ctx, sesion);
+}
+
+// ══════════════════════════════════════════════════════════
 // ── COMANDOS ──────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════
 bot.command('start', async ctx => {
@@ -940,7 +999,7 @@ bot.command('start', async ctx => {
     '👋 *Bienvenido al Bot SENA · Línea CREAR Especial*\n\n' +
     '*Plan de Negocio:*\n' +
     '📝 /nuevo — Crear plan de negocio\n' +
-    '🔁 /retomar — Recargar plan anterior por cédula\n' +
+    '🔁 /retomar — Recargar plan anterior con PIN\n' +
     '↩️ /atras — Corregir respuesta anterior\n' +
     '📋 /resumen — Ver y corregir todas las respuestas\n' +
     '✅ /listo — Generar el Excel oficial SENA\n' +
@@ -986,10 +1045,10 @@ bot.command('retomar', async ctx => {
     return;
   }
   const sesion = await getSesion(chatId);
-  sesion.modo = 'esperando_cedula_retomar';
+  sesion.modo = 'esperando_pin_retomar';
   await setSesion(chatId, sesion);
   await ctx.reply(
-    '🔁 *Retomar plan existente*\n\n¿Cuál es el *número de cédula* del beneficiario?\n_(Los planes se guardan 7 días después de generados)_',
+    '🔁 *Retomar plan existente*\n\n¿Cuál es el *PIN de 4 dígitos* del plan?\n_(Lo recibiste al generar el plan — válido 30 días)_',
     { parse_mode: 'Markdown' }
   );
 });
@@ -1148,18 +1207,21 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
   const enCorreccion = sesion.modo === 'corrigiendo';
   const actual       = getPregunta(sesion.paso, sesion.datos);
 
-  // ── FIX: voz en modo confirmando_viabilidad → redirige al handler de texto ──
-  if (sesion.modo === 'confirmando_viabilidad' || sesion.modo === 'esperando_cedula_retomar') {
+  // Modos que esperan texto libre — transcribir voz y despachar a la función correcta
+  if (sesion.modo === 'confirmando_viabilidad' || sesion.modo === 'esperando_pin_retomar') {
     const msg = await ctx.reply('🎤 Transcribiendo…');
     try {
       const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
       const texto  = await transcribir(fileId);
       await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
-      ctx.message.text = texto;
-      await ctx.emit('message', ctx.message);
+      if (sesion.modo === 'confirmando_viabilidad') {
+        await manejarConfirmacionViabilidad(ctx, texto);
+      } else {
+        await manejarPinRetomar(ctx, texto);
+      }
     } catch (e) {
       console.error('Transcripción fallida:', e.message);
-      await ctx.reply('❌ No pude escuchar. Responde por escrito: *corregir* o *continuar*', { parse_mode: 'Markdown' });
+      await ctx.reply('❌ No pude escuchar. Por favor escribe la respuesta.');
     }
     return;
   }
@@ -1207,53 +1269,13 @@ bot.on('message:text', async ctx => {
   // ── Flujo plan de negocio ──
   const sesion = await getSesion(chatId);
 
-  // ── FIX 3: Confirmar generación pese a EBITDA negativo ──
   if (sesion.modo === 'confirmando_viabilidad') {
-    const resp = ctx.message.text.trim().toLowerCase();
-    if (/^(continuar|si|sí|generar|ok|dale)$/i.test(resp)) {
-      sesion.modo = 'revisando';
-      await setSesion(chatId, sesion);
-      await ctx.reply('Generando el plan con los datos actuales…');
-      await finalizar(ctx, sesion);
-      await delSesion(chatId);
-    } else {
-      sesion.modo = 'revisando';
-      await setSesion(chatId, sesion);
-      await ctx.reply('Volviste al resumen. Corrige los datos y vuelve a escribir /listo.');
-      await mostrarResumen(ctx, sesion);
-    }
+    await manejarConfirmacionViabilidad(ctx, ctx.message.text);
     return;
   }
 
-  // ── FIX 4: Buscar plan anterior por cédula ──────────────
-  if (sesion.modo === 'esperando_cedula_retomar') {
-    const cedula = ctx.message.text.trim().replace(/\D/g, '');
-    if (!cedula) {
-      await ctx.reply('Por favor escribe solo el número de cédula (sin puntos ni espacios).');
-      return;
-    }
-    let datosGuardados = null;
-    try {
-      const raw = await _redis.get(`plan:chat:${chatId}:${cedula}`);
-      if (raw) datosGuardados = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    } catch (e) { console.error('redis get cedula:', e.message); }
-
-    if (!datosGuardados) {
-      await ctx.reply(
-        `No encontré un plan para la cédula *${cedula}*.\n\nLos planes se guardan 7 días. Si pasó más tiempo, usa /nuevo para empezar de cero.`,
-        { parse_mode: 'Markdown' }
-      );
-      sesion.modo = undefined;
-      await setSesion(chatId, sesion);
-      return;
-    }
-
-    sesion.datos = datosGuardados;
-    sesion.paso  = PREGUNTAS.length;
-    sesion.modo  = 'revisando';
-    await setSesion(chatId, sesion);
-    await ctx.reply(`✅ Plan de *${datosGuardados.nombre || cedula}* cargado.`, { parse_mode: 'Markdown' });
-    await mostrarResumen(ctx, sesion);
+  if (sesion.modo === 'esperando_pin_retomar') {
+    await manejarPinRetomar(ctx, ctx.message.text);
     return;
   }
 
