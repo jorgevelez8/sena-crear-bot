@@ -628,20 +628,28 @@ async function generarExcelOficial(datos, costosFijosItems, inversionItems, comp
 }
 
 // ── Transcripción Groq Whisper ────────────────────────────
+const GROQ_TIMEOUT_MS = 25000;
+
 async function transcribir(fileId) {
   const info = await bot.api.getFile(fileId);
   const url  = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${info.file_path}`;
-  const resp = await axios.get(url, { responseType: 'arraybuffer' });
+  const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 15000 });
 
   const tmp = `/tmp/audio_${Date.now()}.ogg`;
   fs.writeFileSync(tmp, Buffer.from(resp.data));
 
   try {
-    const result = await groq.audio.transcriptions.create({
-      file:     fs.createReadStream(tmp),
-      model:    'whisper-large-v3',
-      language: 'es',
-    });
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('Groq timeout')), GROQ_TIMEOUT_MS)
+    );
+    const result = await Promise.race([
+      groq.audio.transcriptions.create({
+        file:     fs.createReadStream(tmp),
+        model:    'whisper-large-v3',
+        language: 'es',
+      }),
+      timeout,
+    ]);
     return result.text.trim();
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
