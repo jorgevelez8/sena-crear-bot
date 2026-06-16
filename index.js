@@ -15,21 +15,106 @@ const groq      = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const Anthropic = require('@anthropic-ai/sdk');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ── Estado en memoria  chatId → { paso, datos, modo } ────
-const sesiones = new Map();
+// ══════════════════════════════════════════════════════════
+// ── SESIONES — Redis (persistente) con fallback en memoria
+// ══════════════════════════════════════════════════════════
+// PUNTO 2: Sesiones sobreviven reinicios de Render.
+// Si UPSTASH_REDIS_REST_URL no está configurado, usa Map en memoria.
 
-// ── Preguntas (~38, cubre formato oficial SENA) ───────────
+let _redis = null;
+try {
+  if (process.env.UPSTASH_REDIS_REST_URL) {
+    const { Redis } = require('@upstash/redis');
+    _redis = new Redis({
+      url:   process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+    console.log('✅ Redis Upstash conectado — sesiones persistentes');
+  } else {
+    console.warn('⚠️  UPSTASH_REDIS_REST_URL no configurado — sesiones en memoria (se pierden al reiniciar)');
+  }
+} catch (e) {
+  console.error('Redis init error:', e.message);
+}
+
+const _planMem = new Map();
+const _dxMem   = new Map();
+const TTL       = 172800; // 48 horas en segundos
+
+async function getSesion(chatId) {
+  if (_redis) {
+    try {
+      const d = await _redis.get(`plan:${chatId}`);
+      if (d) return typeof d === 'string' ? JSON.parse(d) : d;
+    } catch (e) { console.error('redis get plan:', e.message); }
+  }
+  if (!_planMem.has(chatId)) _planMem.set(chatId, { paso: 0, datos: {} });
+  return _planMem.get(chatId);
+}
+
+async function setSesion(chatId, sesion) {
+  _planMem.set(chatId, sesion);
+  if (_redis) {
+    try { await _redis.setex(`plan:${chatId}`, TTL, JSON.stringify(sesion)); }
+    catch (e) { console.error('redis set plan:', e.message); }
+  }
+}
+
+async function delSesion(chatId) {
+  _planMem.delete(chatId);
+  if (_redis) {
+    try { await _redis.del(`plan:${chatId}`); } catch {}
+  }
+}
+
+async function getDxSesion(chatId) {
+  if (_redis) {
+    try {
+      const d = await _redis.get(`dx:${chatId}`);
+      if (d) return typeof d === 'string' ? JSON.parse(d) : d;
+    } catch (e) { console.error('redis get dx:', e.message); }
+  }
+  if (!_dxMem.has(chatId)) _dxMem.set(chatId, { paso: 0, datos: { scores: Array(40).fill(null) } });
+  return _dxMem.get(chatId);
+}
+
+async function setDxSesion(chatId, sesion) {
+  _dxMem.set(chatId, sesion);
+  if (_redis) {
+    try { await _redis.setex(`dx:${chatId}`, TTL, JSON.stringify(sesion)); }
+    catch (e) { console.error('redis set dx:', e.message); }
+  }
+}
+
+async function delDxSesion(chatId) {
+  _dxMem.delete(chatId);
+  if (_redis) {
+    try { await _redis.del(`dx:${chatId}`); } catch {}
+  }
+}
+
+async function hasDxSesion(chatId) {
+  if (_dxMem.has(chatId)) return true;
+  if (_redis) {
+    try { return (await _redis.exists(`dx:${chatId}`)) > 0; } catch {}
+  }
+  return false;
+}
+
+// ══════════════════════════════════════════════════════════
+// ── PREGUNTAS (~41, cubre formato oficial SENA) ───────────
+// ══════════════════════════════════════════════════════════
 const PREGUNTAS = [
   // === Datos del beneficiario ===
   {
     key: 'nombre',
     msg: '¡Hola! 👋 Vamos a crear el *Plan de Negocio SENA Línea CREAR*.\nPuedes responder con voz 🎤 o escribiendo.\n\n¿Cuál es el *nombre completo* del beneficiario?',
   },
-  { key: 'tipoDoc',       msg: '¿*Tipo de documento*?\n_(CC Cédula · CE Cédula Extranjería · PA Pasaporte · TI Tarjeta Identidad)_' },
-  { key: 'numDoc',        msg: '¿*Número de documento*?' },
-  { key: 'genero',        msg: '¿*Género*?\n_(Masculino / Femenino / Otro)_' },
-  { key: 'departamento',  msg: '¿En qué *departamento* está el proyecto?' },
-  { key: 'municipio',     msg: '¿En qué *municipio*?' },
+  { key: 'tipoDoc',      msg: '¿*Tipo de documento*?\n_(CC Cédula · CE Cédula Extranjería · PA Pasaporte · TI Tarjeta Identidad)_' },
+  { key: 'numDoc',       msg: '¿*Número de documento*?' },
+  { key: 'genero',       msg: '¿*Género*?\n_(Masculino / Femenino / Otro)_' },
+  { key: 'departamento', msg: '¿En qué *departamento* está el proyecto?' },
+  { key: 'municipio',    msg: '¿En qué *municipio*?' },
   {
     key: 'grupoPoblacional',
     msg: '¿A qué *grupo poblacional* pertenece?\n_(Ej: Víctima de violencia, Desplazado, Campesino, Indígena, Afrocolombiano, LGBTI, Discapacidad...)_',
@@ -44,7 +129,7 @@ const PREGUNTAS = [
     key: 'ciiu',
     msg: '¿Cuál es la *actividad económica* (código CIIU)?\n_(Ej: 0111 Cultivo de cereales · 4711 Tienda alimentos · 1411 Confección ropa...)_',
   },
-  { key: 'asociativo',   msg: '¿El proyecto es *asociativo* (varias personas juntas)?\n_Responda: SI o NO_' },
+  { key: 'asociativo',  msg: '¿El proyecto es *asociativo* (varias personas juntas)?\n_Responda: SI o NO_' },
   {
     key: 'numPersonas',
     msg: '¿*Cuántas personas* conforman el grupo asociativo?',
@@ -85,12 +170,12 @@ const PREGUNTAS = [
   { key: 'pvMediante',  msg: '*"...mediante..."*\n_(¿Cómo lo logran? ¿Qué hace diferente su negocio?)_' },
 
   // === Sección 5 — Productos o servicios ===
-  { key: 'prod1Nombre', msg: '¿Cuál es el *nombre del producto o servicio principal*?' },
-  { key: 'prod1Desc',   msg: '¿Cómo lo *describiría*? ¿Qué es exactamente?' },
-  { key: 'prod1Unidad', msg: '¿Cuál es la *unidad de medida*?\n_(Ej: Kilogramo, Litro, Unidad, Hora, Docena, Porción...)_' },
-  { key: 'prod1Precio',      msg: '¿A qué *precio* lo vende?\n_(Número en pesos, ej: 15000 o "quince mil pesos")_', numerico: true },
-  { key: 'prod1UnidadesMes', msg: '¿Cuántas *unidades vende al mes* aproximadamente?\n_(Número)_', numerico: true },
-  { key: 'prod1Costo',       msg: '¿Cuánto le *cuesta producir* cada unidad?\n_(Materias primas e insumos — número en pesos)_', numerico: true },
+  { key: 'prod1Nombre',     msg: '¿Cuál es el *nombre del producto o servicio principal*?' },
+  { key: 'prod1Desc',       msg: '¿Cómo lo *describiría*? ¿Qué es exactamente?' },
+  { key: 'prod1Unidad',     msg: '¿Cuál es la *unidad de medida*?\n_(Ej: Kilogramo, Litro, Unidad, Hora, Docena, Porción...)_' },
+  { key: 'prod1Precio',     msg: '¿A qué *precio* lo vende?\n_(Número en pesos, ej: 15000 o "quince mil pesos")_', numerico: true },
+  { key: 'prod1UnidadesMes',msg: '¿Cuántas *unidades vende al mes* aproximadamente?\n_(Número)_', numerico: true },
+  { key: 'prod1Costo',      msg: '¿Cuánto le *cuesta producir* cada unidad?\n_(Materias primas e insumos — número en pesos)_', numerico: true },
 
   // === Sección 10 — Costos fijos ===
   {
@@ -98,6 +183,30 @@ const PREGUNTAS = [
     msg: '¿Cuáles son sus *costos fijos mensuales*?\nCuénteme los gastos que paga todos los meses aunque no venda nada: arriendo, servicios, internet, transporte...',
   },
   { key: 'costosFijosTotal', msg: '¿Cuánto suman esos costos fijos *en total al mes*?\n_(Número en pesos)_', numerico: true },
+
+  // === Sección 11 — Mano de obra ===
+  // PUNTO 5: Alimenta D16 del MODELO FINANCIERO (filas 388-393 del template)
+  {
+    key: 'manoObraTotal',
+    msg: '¿Paga *sueldos o jornales* a empleados?\n¿Cuánto paga en total al mes en sueldos?\n_(Si trabaja solo sin sueldo fijo, diga *cero*)_',
+    numerico: true,
+  },
+
+  // === Sección 15 — Gastos de administración y ventas ===
+  // PUNTO 5: Alimenta D20 del MODELO FINANCIERO (filas 357-366 del template, col M y U)
+  {
+    key: 'gastosAdmin',
+    msg: '¿Cuánto gasta al mes en *administración y ventas*?\n_(Publicidad, internet, papelería, transporte de ventas, contador, delivery...)_\n_Si no tiene, diga *cero*_',
+    numerico: true,
+  },
+
+  // === Sección 7 — Permisos y licencias ===
+  // PUNTO 5: Alimenta D18 del MODELO FINANCIERO (Z184 del template)
+  {
+    key: 'permisosTotal',
+    msg: '¿Cuánto *invirtió o necesita invertir* en permisos, licencias o registros?\n_(RUT, Cámara de Comercio, INVIMA, sanidad, registro de marca...)_\n_Si no tiene, diga *cero*_',
+    numerico: true,
+  },
 
   // === Sección 12 — Inversión ===
   { key: 'inversion',    msg: '¿Cuánto necesita *invertir en total*?\n_(Maquinaria, equipos, adecuaciones, materias primas iniciales — número)_', numerico: true },
@@ -112,16 +221,39 @@ const PREGUNTAS = [
   { key: 'impactoSocial', msg: '¿Qué *impacto social* tiene el proyecto?\n_(A cuántas familias ayuda, qué cambia en su comunidad)_' },
 ];
 
+// ── Campos obligatorios para /listo ───────────────────────
+// PUNTO 3: /listo bloqueado si alguno falta
+const CAMPOS_REQUERIDOS = [
+  { key: 'nombre',          label: 'Nombre completo' },
+  { key: 'numDoc',          label: 'Número de documento' },
+  { key: 'departamento',    label: 'Departamento' },
+  { key: 'municipio',       label: 'Municipio' },
+  { key: 'nombreProyecto',  label: 'Nombre del proyecto' },
+  { key: 'tipoProyecto',    label: 'Tipo de proyecto' },
+  { key: 'sector',          label: 'Sector' },
+  { key: 'clienteCarac',    label: 'Descripción del cliente' },
+  { key: 'problema',        label: 'Problema que resuelve' },
+  { key: 'prod1Nombre',     label: 'Nombre del producto' },
+  { key: 'prod1Precio',     label: 'Precio' },
+  { key: 'prod1UnidadesMes',label: 'Unidades por mes' },
+  { key: 'prod1Costo',      label: 'Costo por unidad' },
+  { key: 'inversion',       label: 'Inversión total' },
+  { key: 'aportePropio',    label: 'Aporte propio' },
+  { key: 'inversionDesc',   label: 'Uso del dinero FE' },
+];
+
+function validarCamposObligatorios(datos) {
+  const faltantes = CAMPOS_REQUERIDOS
+    .filter(c => !datos[c.key] || datos[c.key].trim() === '')
+    .map(c => c.label);
+  return faltantes; // [] = todo bien
+}
+
 // ── Helpers básicos ───────────────────────────────────────
 function limpiarNombre(texto) {
   return texto
     .replace(/^(mi nombre (completo )?es|me llamo|yo me llamo|soy|yo soy|me dicen)\s+/i, '')
     .trim();
-}
-
-function getSesion(chatId) {
-  if (!sesiones.has(chatId)) sesiones.set(chatId, { paso: 0, datos: {} });
-  return sesiones.get(chatId);
 }
 
 function getPregunta(paso, datos) {
@@ -172,29 +304,39 @@ function getLastAnsweredIndex(sesion) {
   return -1;
 }
 
-// ── extraerNumero: verbal → número via Claude ─────────────
-// Resuelve "un millón quinientos mil" → 1500000
+// ══════════════════════════════════════════════════════════
+// ── PARSEO CON CLAUDE ─────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+
+// PUNTO 4: extraerNumero devuelve null en fallo (no 0 silencioso)
 async function extraerNumero(texto) {
-  const clean = String(texto).replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
-  if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean) || 0;
+  const t = String(texto).trim();
+  // Fast-path: ya es número
+  const clean = t.replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+  if (/^\d+(\.\d+)?$/.test(clean)) return parseFloat(clean);
+  // Expresiones de cero legítimas
+  if (/^(cero|nada|no\s+ten|no\s+hay|ninguno|0)$/i.test(t)) return 0;
+  // Llamar Haiku
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model:      'claude-haiku-4-5-20251001',
       max_tokens: 15,
-      messages: [{ role: 'user', content: `Número del texto (solo dígitos enteros, sin puntos ni comas): "${texto}"` }],
+      messages:   [{ role: 'user', content: `Número del texto (solo dígitos enteros, sin puntos ni comas): "${texto}"` }],
     });
-    return Number(msg.content[0].text.replace(/[^\d]/g, '')) || 0;
-  } catch { return 0; }
+    const n = Number(msg.content[0].text.replace(/[^\d]/g, ''));
+    return isNaN(n) ? null : n; // null = no se pudo → caller pide repetir
+  } catch {
+    return null; // API caída → null para que caller informe al usuario
+  }
 }
 
-// ── parsearCompetidor: texto libre → campos del Excel ─────
 async function parsearCompetidor(texto) {
   if (!texto || /^no\s*hay/i.test(texto.trim())) return null;
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model:      'claude-haiku-4-5-20251001',
       max_tokens: 200,
-      messages: [{
+      messages:   [{
         role: 'user',
         content: `Del siguiente texto sobre un competidor extrae y responde SOLO un JSON con estos campos (strings): nombre, localizacion, producto, precio, ventajas, desventajas. Si no encuentras un campo deja "". Sin texto extra.\nTexto: "${texto}"`,
       }],
@@ -206,14 +348,13 @@ async function parsearCompetidor(texto) {
   }
 }
 
-// ── parsearCostosFijos: texto → lista {desc, valorMensual} ─
 async function parsearCostosFijos(texto, total) {
   if (!texto) return [{ descripcion: 'Costos fijos', valorMensual: total }];
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model:      'claude-haiku-4-5-20251001',
       max_tokens: 300,
-      messages: [{
+      messages:   [{
         role: 'user',
         content: `Lista de costos fijos del texto. Solo JSON array sin texto extra:\n[{"descripcion":"...","valorMensual":0},...]\nTexto: "${texto}"\nTotal mensual: ${total}`,
       }],
@@ -226,14 +367,13 @@ async function parsearCostosFijos(texto, total) {
   }
 }
 
-// ── parsearInversion: texto → lista {desc, cantidad, valor} ─
 async function parsearInversion(texto, total) {
   if (!texto) return [{ descripcion: 'Inversión', cantidad: 1, valor: total }];
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model:      'claude-haiku-4-5-20251001',
       max_tokens: 300,
-      messages: [{
+      messages:   [{
         role: 'user',
         content: `Lista de inversiones del texto. Solo JSON array sin texto extra:\n[{"descripcion":"...","cantidad":1,"valor":0},...]\nTexto: "${texto}"\nTotal: ${total}`,
       }],
@@ -246,10 +386,9 @@ async function parsearInversion(texto, total) {
   }
 }
 
-// ── Generar Plan Narrativo con Claude ─────────────────────
 async function generarPlanCompleto(datos) {
   const d = datos;
-  const p   = Number(d.prod1Precio)     || 0;
+  const p   = Number(d.prod1Precio)      || 0;
   const u   = Number(d.prod1UnidadesMes) || 0;
   const cv  = Number(d.prod1Costo)       || 0;
   const cf  = Number(d.costosFijosTotal) || 0;
@@ -290,164 +429,180 @@ DATOS DEL BENEFICIARIO:
   return JSON.parse(raw);
 }
 
-// ── Llenar Excel oficial SENA ─────────────────────────────
+// ══════════════════════════════════════════════════════════
+// ── EXCEL OFICIAL SENA ────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+// PUNTO 5: Incluye mano de obra (D16), permisos (D18) y G&A (D20)
 async function generarExcelOficial(datos, costosFijosItems, inversionItems, comps) {
-  const templatePath = path.join(__dirname, 'template.xlsx');
-  const wb = XLSX.readFile(templatePath, { cellFormula: true, cellStyles: true });
+  const wb = XLSX.readFile(path.join(__dirname, 'template.xlsx'), { cellFormula: true, cellStyles: true });
   const ws = wb.Sheets['PROYECTO'];
 
-  // Escribe en la celda top-left de cada merge (preserva merges y estilos)
   function set(addr, value) {
     if (value === null || value === undefined || value === '') return;
     const t = typeof value === 'number' ? 'n' : 's';
     ws[addr] = { t, v: value, w: String(value) };
   }
 
-  const d = datos;
-  const p1   = Number(d.prod1Precio)     || 0;
-  const u1   = Number(d.prod1UnidadesMes) || 0;
-  const cv1  = Number(d.prod1Costo)       || 0;
-  const cf   = Number(d.costosFijosTotal) || 0;
-  const inv  = Number(d.inversion)        || 0;
-  const ap   = Number(d.aportePropio)     || 0;
-  const np   = Number(d.numPersonas)      || 1;
-
-  // Precios años 2 y 3 (+4% y +8%)
-  const p1a2 = Math.round(p1 * 1.04);
-  const p1a3 = Math.round(p1 * 1.08);
-  // Unidades años 2 y 3 (+10% y +20%)
+  const d   = datos;
+  const p1  = Number(d.prod1Precio)      || 0;
+  const u1  = Number(d.prod1UnidadesMes) || 0;
+  const cv1 = Number(d.prod1Costo)       || 0;
+  const inv = Number(d.inversion)        || 0;
+  const ap  = Number(d.aportePropio)     || 0;
+  const np  = Number(d.numPersonas)      || 1;
   const u1a2 = Math.round(u1 * 1.10);
   const u1a3 = Math.round(u1 * 1.20);
 
   // ── Datos básicos ──
-  set('B10', d.nombre || '');
-  set('T10', d.tipoDoc || 'CC');
+  set('B10',  d.nombre || '');
+  set('T10',  d.tipoDoc || 'CC');
   set('AC10', d.numDoc || '');
-  set('B14', d.nombreProyecto || '');
-  set('T14', d.departamento || '');
+  set('B14',  d.nombreProyecto || '');
+  set('T14',  d.departamento || '');
   set('AC14', d.municipio || '');
-  set('B18', d.tipoProyecto || '');
-  set('L18', d.sector || '');
-  set('Z18', d.ciiu || '');
+  set('B18',  d.tipoProyecto || '');
+  set('L18',  d.sector || '');
+  set('Z18',  d.ciiu || '');
   set('R21', /^s/i.test(d.asociativo || '') ? 'SI' : 'NO');
   if (/^s/i.test(d.asociativo || '')) set('AN21', np);
   set('R23', /^s/i.test(d.lugarOps || '') ? 'SI' : 'NO');
 
-  // ── Sección 1 — Cliente ──
+  // ── Cliente ──
   set('A61', d.clienteCarac || '');
-  set('S61', d.clienteCual || '');
+  set('S61', d.clienteCual  || '');
 
-  // ── Sección 2 — Problema ──
+  // ── Problema ──
   set('A77', d.problema || '');
 
-  // ── Sección 3 — Competidores ──
-  // Filas 94, 95, 96 · cols: A(nombre) I(loc) R(prod) X(precio) AC(ventajas) AK(desventajas)
+  // ── Competidores (filas 94-96) ──
   for (let i = 0; i < 3; i++) {
     const comp = comps[i];
     if (!comp) continue;
     const r = 94 + i;
-    set(`A${r}`, comp.nombre || '');
-    set(`I${r}`, comp.localizacion || '');
-    set(`R${r}`, comp.producto || '');
-    set(`X${r}`, comp.precio || '');
-    set(`AC${r}`, comp.ventajas || '');
-    set(`AK${r}`, comp.desventajas || '');
+    set(`A${r}`,  comp.nombre       || '');
+    set(`I${r}`,  comp.localizacion || '');
+    set(`R${r}`,  comp.producto     || '');
+    set(`X${r}`,  comp.precio       || '');
+    set(`AC${r}`, comp.ventajas     || '');
+    set(`AK${r}`, comp.desventajas  || '');
   }
 
-  // ── Sección 4 — Descripción y propuesta de valor ──
+  // ── Descripción y propuesta de valor ──
   set('I102', d.descripcion || '');
-  set('G105', d.pvNuestro || '');
-  set('G106', d.pvAyuda || '');
-  set('G107', d.pvQue || '');
-  set('G108', d.pvMediante || '');
+  set('G105', d.pvNuestro   || '');
+  set('G106', d.pvAyuda     || '');
+  set('G107', d.pvQue       || '');
+  set('G108', d.pvMediante  || '');
 
-  // ── Sección 5 — Productos ──
-  // Tabla de nombres (fila 116)
+  // ── Productos (fila 116) ──
   set('A116', d.prod1Nombre || '');
-  set('K116', d.prod1Desc || '');
+  set('K116', d.prod1Desc   || '');
   set('Y116', d.prod1Unidad || '');
-  set('AF116', d.prod1Unidad || '');
 
-  // ── Sección 9 — Precios proyectados ──
-  // A229 = fórmula +A116 (auto-rellena desde nombre del producto), W229/AC229 = fórmulas de inflación
-  // Solo escribimos Q229 (precio año 1); años 2 y 3 calculan solos
+  // ── Precios (fila 229) — solo Q229 (año 1); W229/AC229 son fórmulas ──
   set('Q229', p1);
 
-  // ── Sección 9 — Unidades mensuales (filas 241-252) ──
-  // Col G = año 1 · Col S = año 2 · Col AE = año 3
+  // ── Unidades mensuales (filas 241-252) ──
   for (let mes = 0; mes < 12; mes++) {
     const row = 241 + mes;
-    set(`G${row}`, u1);
-    set(`S${row}`, u1a2);
+    set(`G${row}`,  u1);
+    set(`S${row}`,  u1a2);
     set(`AE${row}`, u1a3);
   }
 
-  // ── Sección 10 — Costos fijos (filas 297-304) ──
-  // Cols: A=descripcion · T=valor mensual · AA=cantidad año 1 (12 meses)
-  // AE = fórmula +T*AA — NO escribir
+  // ── Costos fijos (filas 297-304): A=desc · T=valor mensual · AA=12 meses ──
+  // AE = fórmula T*AA → NO escribir
   for (let i = 0; i < Math.min(costosFijosItems.length, 8); i++) {
-    const row = 297 + i;
+    const row  = 297 + i;
     const item = costosFijosItems[i];
     set(`A${row}`,  item.descripcion || '');
     set(`T${row}`,  Number(item.valorMensual) || 0);
-    set(`AA${row}`, 12); // 12 meses → AE auto-calcula T*AA
+    set(`AA${row}`, 12);
   }
 
-  // ── Sección 10 — Costos variables producto 1 (fila 318) ──
-  // A=materia prima · K=unidad · R=valor unitario · AA=cantidad por unidad
-  // AE = fórmula +R*AA — NO escribir
+  // ── Costos variables producto 1 (fila 318): A=desc · K=unidad · R=valor unit · AA=cant ──
+  // AE = fórmula R*AA → NO escribir
   set('A318', 'Materias primas e insumos');
   set('K318', 'Unidad');
-  set('R318', cv1); // columna R = "Valor unitario ($)" (no T)
-  set('AA318', 1);  // 1 insumo por arepa → fórmula AE318 = R318*AA318
+  set('R318', cv1);
+  set('AA318', 1);
 
-  // ── Sección 10 — % Participación producto 1 (fila 349) ──
-  set('Q349', 100);  // col Q para producto 1, 100% si solo hay 1 producto
+  // ── % Participación producto 1 (fila 349) ──
+  set('Q349', 100);
 
-  // ── Sección 12 — Inversiones fijas (filas 403-422) ──
-  // Fila 402 = encabezado. Cols input: A=descripcion · T=valor unitario · AA=cantidad
-  // AD = fórmula +T*AA · AM="X" = aporte FE · AO="X" = aporte emprendedor
-  // AE448 = fórmula SUM(AD) → NO escribir
-  // AE449 = fórmula SUMIF(AO,"X",AD) → NO escribir
-  // AE450 = fórmula AE448-AE449 → NO escribir
+  // ── PUNTO 5A: Mano de obra (fila 389) — alimenta D16 del MODELO FINANCIERO ──
+  // D16 = AK389*AP389. AK389 = IF(AH389="SI", AB389*(1+I383), AB389)
+  // AB389=sueldo mensual · AH389="NO"(sin prestaciones para emprendedor informal) · AP389=12 meses
   {
-    const items = inversionItems.slice(0, 19); // máx 20 filas (403-422)
-    let sumItems = items.reduce((s, it) => s + (Number(it.valor) || 0), 0);
-    // Si queda diferencia por el aporte propio no listado, ajustar último ítem
-    const diff = inv - sumItems;
+    const manoObra = Number(d.manoObraTotal) || 0;
+    if (manoObra > 0) {
+      set('A389',  d.manoObraDesc || 'Empleado/Operario');
+      set('G389',  'Empleo directo');
+      set('AB389', manoObra);
+      set('AH389', 'NO'); // sin factor prestacional (autoempleado informal)
+      set('AP389', 12);   // 12 meses · D16 = AK389*AP389 = manoObra*12
+    }
+  }
+
+  // ── PUNTO 5B: Permisos y licencias (fila 184, col Z) — alimenta D18 ──
+  // Z190 = SUM(Z184:AF189). Z183=Costo($) es encabezado. Z184=primer ítem.
+  {
+    const permisos = Number(d.permisosTotal) || 0;
+    if (permisos > 0) {
+      set('Z184', permisos); // costo total en permiso/licencia fila 1
+    }
+  }
+
+  // ── PUNTO 5C: Gastos de administración y ventas (fila 358) — alimenta D20 ──
+  // Y367 = SUM(Y357:AD366). Y358 = M358*U358. M=valor mensual · U=meses(12).
+  {
+    const gastos = Number(d.gastosAdmin) || 0;
+    if (gastos > 0) {
+      set('A358', 'Gastos de administración y ventas');
+      set('M358', gastos);
+      set('U358', 12); // Y358 = M358*U358 = gastos*12 (auto-calcula)
+    }
+  }
+
+  // ── Inversiones fijas (filas 403-422) ──
+  // Fila 402 = encabezado. T=valor unit · AA=cant. AD=fórmula T*AA → NO escribir
+  // AM="X" FE · AO="X" emprendedor. AE448/449/450 = fórmulas → NO escribir
+  {
+    const items   = inversionItems.slice(0, 19);
+    const sumItems = items.reduce((s, it) => s + (Number(it.valor) || 0), 0);
+    const diff     = inv - sumItems;
 
     for (let i = 0; i < items.length; i++) {
       const row  = 403 + i;
       const item = items[i];
       let valor  = Number(item.valor) || 0;
-      // Si es el último ítem y hay diferencia, absorberla
       if (i === items.length - 1 && Math.abs(diff) > 0) valor += diff;
       set(`A${row}`,  item.descripcion || '');
-      set(`T${row}`,  valor);              // Valor unitario
+      set(`T${row}`,  valor);
       set(`AA${row}`, Number(item.cantidad) || 1);
-      set(`AM${row}`, 'X');               // Todo como aporte FE por defecto
+      set(`AM${row}`, 'X'); // FE por defecto
     }
-    // Si hay aporte propio: agregar una fila extra marcada como emprendedor
+
+    // Aporte propio: fila extra marcada como emprendedor
     if (ap > 0 && items.length < 20) {
       const rowAp = 403 + items.length;
       set(`A${rowAp}`,  'Capital propio del emprendedor');
       set(`T${rowAp}`,  ap);
       set(`AA${rowAp}`, 1);
-      set(`AO${rowAp}`, 'X');  // AO = aporte emprendedor
-      // Reducir el primer ítem FE para mantener el total correcto
-      const row0 = 403;
-      const cell0 = ws[`T${row0}`];
+      set(`AO${rowAp}`, 'X'); // emprendedor
+      // Reducir primer ítem FE para que el total cuadre
+      const cell0 = ws['T403'];
       if (cell0 && cell0.v) {
-        ws[`T${row0}`] = { t: 'n', v: Math.max(0, Number(cell0.v) - ap), w: String(Math.max(0, Number(cell0.v) - ap)) };
+        ws['T403'] = { t: 'n', v: Math.max(0, Number(cell0.v) - ap), w: String(Math.max(0, Number(cell0.v) - ap)) };
       }
     }
   }
 
-  // ── Sección 14 — Avances ──
-  set('G459', 'En proceso');   // Legal
-  set('G460', 'Identificado'); // Comercial
+  // ── Avances ──
+  set('G459', 'En proceso');
+  set('G460', 'Identificado');
 
-  // ── Sección 16 — Impacto ──
+  // ── Impacto ──
   set('K487', d.impactoEco    || '');
   set('K489', d.impactoSocial || '');
 
@@ -479,8 +634,8 @@ async function transcribir(fileId) {
 async function finalizar(ctx, sesion) {
   await ctx.reply('🎉 *¡Plan completado!* Procesando con IA… ⏳\n_Esto puede tardar 30-60 segundos._', { parse_mode: 'Markdown' });
 
-  const d = sesion.datos;
-  const p   = Number(d.prod1Precio)     || 0;
+  const d   = sesion.datos;
+  const p   = Number(d.prod1Precio)      || 0;
   const u   = Number(d.prod1UnidadesMes) || 0;
   const cv  = Number(d.prod1Costo)       || 0;
   const cf  = Number(d.costosFijosTotal) || 0;
@@ -488,7 +643,6 @@ async function finalizar(ctx, sesion) {
   const ap  = Number(d.aportePropio)     || 0;
   const np  = Number(d.numPersonas)      || 1;
 
-  // 1. Parsear competidores, costos e inversión en paralelo
   const [comp1, comp2, comp3, costosFijosItems, inversionItems] = await Promise.all([
     parsearCompetidor(d.competidor1),
     parsearCompetidor(d.competidor2),
@@ -498,7 +652,6 @@ async function finalizar(ctx, sesion) {
   ]);
   const comps = [comp1, comp2, comp3];
 
-  // 2. Generar plan narrativo
   let planIA = null;
   try {
     planIA = await generarPlanCompleto(d);
@@ -507,7 +660,6 @@ async function finalizar(ctx, sesion) {
     await ctx.reply('⚠️ No pude generar las secciones narrativas, pero el Excel oficial sí va a salir.');
   }
 
-  // 3. Llenar Excel oficial SENA
   const fecha  = new Date().toISOString().slice(0, 10);
   const nombre = (d.nombre || 'beneficiario').replace(/\s+/g, '_');
 
@@ -520,7 +672,7 @@ async function finalizar(ctx, sesion) {
     return;
   }
 
-  const fnOficial = `PROYECTO_CREAR_${nombre}_${fecha}.xlsx`;
+  const fnOficial  = `PROYECTO_CREAR_${nombre}_${fecha}.xlsx`;
   const tmpOficial = `/tmp/${fnOficial}`;
   XLSX.writeFile(wbOficial, tmpOficial);
 
@@ -537,7 +689,6 @@ async function finalizar(ctx, sesion) {
   });
   try { fs.unlinkSync(tmpOficial); } catch {}
 
-  // 4. Si hay plan narrativo, enviar también el plan completo
   if (planIA) {
     const ven1 = p * u * 12;
     const ven2 = Math.round(p * 1.04 * (u * 1.1) * 12);
@@ -551,33 +702,32 @@ async function finalizar(ctx, sesion) {
 
     const wb2 = XLSX.utils.book_new();
 
-    // Hoja 1 — Datos del beneficiario
     const ws1 = XLSX.utils.aoa_to_sheet([
       ['PLAN DE NEGOCIO — SENA LÍNEA CREAR ESPECIAL'],
       ['Bot de voz · ' + fecha],
       [],
       ['BENEFICIARIO'],
-      ['Nombre completo',     d.nombre        || ''],
+      ['Nombre completo',     d.nombre          || ''],
       ['Tipo / N° documento', (d.tipoDoc || 'CC') + ' ' + (d.numDoc || '')],
-      ['Género',              d.genero        || ''],
-      ['Municipio',           d.municipio     || ''],
-      ['Departamento',        d.departamento  || ''],
+      ['Género',              d.genero          || ''],
+      ['Municipio',           d.municipio       || ''],
+      ['Departamento',        d.departamento    || ''],
       ['Grupo poblacional',   d.grupoPoblacional || ''],
       [],
       ['PROYECTO'],
-      ['Nombre del proyecto', d.nombreProyecto || ''],
-      ['Tipo de proyecto',    d.tipoProyecto  || ''],
+      ['Nombre del proyecto', d.nombreProyecto  || ''],
+      ['Tipo de proyecto',    d.tipoProyecto    || ''],
       ['Sector / CIIU',       (d.sector || '') + ' · ' + (d.ciiu || '')],
       ['Modalidad',           /^s/i.test(d.asociativo || '') ? `Asociativo ${np} personas` : 'Individual'],
       ['Maletín de formación', fmt(kit)],
       ['Lugar de operaciones', /^s/i.test(d.lugarOps || '') ? 'SÍ' : 'NO'],
       [],
       ['PROPUESTA DE VALOR'],
-      ['Descripción',         d.descripcion || ''],
-      ['Nuestro:',            d.pvNuestro   || ''],
-      ['Ayuda a:',            d.pvAyuda     || ''],
-      ['A que:',              d.pvQue       || ''],
-      ['Mediante:',           d.pvMediante  || ''],
+      ['Descripción',  d.descripcion || ''],
+      ['Nuestro:',     d.pvNuestro   || ''],
+      ['Ayuda a:',     d.pvAyuda     || ''],
+      ['A que:',       d.pvQue       || ''],
+      ['Mediante:',    d.pvMediante  || ''],
       [],
       ['PRODUCTO PRINCIPAL'],
       ['Nombre',       d.prod1Nombre || ''],
@@ -587,7 +737,6 @@ async function finalizar(ctx, sesion) {
     ws1['!cols'] = [{ wch: 28 }, { wch: 65 }];
     XLSX.utils.book_append_sheet(wb2, ws1, 'DATOS');
 
-    // Hoja 2 — Modelo financiero
     const ws2 = XLSX.utils.aoa_to_sheet([
       ['MODELO FINANCIERO'],
       [],
@@ -602,6 +751,9 @@ async function finalizar(ctx, sesion) {
       ['COSTOS'],
       ['Costo variable/unidad',             cv],
       ['Costos fijos/mes',                  cf],
+      ['Mano de obra/mes',                  Number(d.manoObraTotal) || 0],
+      ['Gastos admin y ventas/mes',         Number(d.gastosAdmin)   || 0],
+      ['Permisos y licencias (total)',      Number(d.permisosTotal) || 0],
       [],
       ['RESULTADOS AÑO 1'],
       ['Margen bruto',                      ven1 - cv * u * 12],
@@ -618,14 +770,13 @@ async function finalizar(ctx, sesion) {
     ws2['!cols'] = [{ wch: 40 }, { wch: 22 }];
     XLSX.utils.book_append_sheet(wb2, ws2, 'MODELO FINANCIERO');
 
-    // Hoja 3 — Plan narrativo
     const secciones = [
-      ['DESCRIPCIÓN DEL NEGOCIO',     planIA.descripcionNegocio],
-      ['MERCADO OBJETIVO',             planIA.mercadoObjetivo],
-      ['ANÁLISIS DE COMPETENCIA',      planIA.analisisCompetencia],
-      ['ESTRATEGIA COMERCIAL',         planIA.estrategiaComercial],
-      ['PLAN OPERATIVO',               planIA.planOperativo],
-      ['ANÁLISIS DE RIESGOS',          planIA.analisisRiesgos],
+      ['DESCRIPCIÓN DEL NEGOCIO',      planIA.descripcionNegocio],
+      ['MERCADO OBJETIVO',              planIA.mercadoObjetivo],
+      ['ANÁLISIS DE COMPETENCIA',       planIA.analisisCompetencia],
+      ['ESTRATEGIA COMERCIAL',          planIA.estrategiaComercial],
+      ['PLAN OPERATIVO',                planIA.planOperativo],
+      ['ANÁLISIS DE RIESGOS',           planIA.analisisRiesgos],
       ['JUSTIFICACIÓN DE LA INVERSIÓN', planIA.justificacionInversion],
     ];
     const filas = [['PLAN NARRATIVO — SENA LÍNEA CREAR'], ['Generado con IA · ' + fecha], []];
@@ -638,7 +789,7 @@ async function finalizar(ctx, sesion) {
     ws3['!cols'] = [{ wch: 120 }];
     XLSX.utils.book_append_sheet(wb2, ws3, 'PLAN NARRATIVO');
 
-    const fnPlan = `PlanNarrado_${nombre}_${fecha}.xlsx`;
+    const fnPlan  = `PlanNarrado_${nombre}_${fecha}.xlsx`;
     const tmpPlan = `/tmp/${fnPlan}`;
     XLSX.writeFile(wb2, tmpPlan);
     await ctx.replyWithDocument(new InputFile(tmpPlan, fnPlan), {
@@ -651,23 +802,34 @@ async function finalizar(ctx, sesion) {
   await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario.');
 }
 
-// ── Procesar respuesta y avanzar ──────────────────────────
+// ══════════════════════════════════════════════════════════
+// ── PROCESAR RESPUESTA ────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+// PUNTO 4: error de extraerNumero → pregunta al usuario, no guarda 0
 async function procesarRespuesta(ctx, texto) {
   const chatId = ctx.chat.id;
-  const sesion = getSesion(chatId);
+  const sesion = await getSesion(chatId);
   const actual = getPregunta(sesion.paso, sesion.datos);
   if (!actual) return;
 
   const { p, i } = actual;
   let valor = p.key === 'nombre' ? limpiarNombre(texto) : texto;
 
-  // Campos numéricos: parsear números verbales con Claude
   if (p.numerico) {
-    valor = String(await extraerNumero(texto));
+    const n = await extraerNumero(texto);
+    if (n === null) {
+      await ctx.reply(
+        '⚠️ No entendí ese número. Escríbalo en dígitos _(ej: 150000)_ o repítalo más claro.',
+        { parse_mode: 'Markdown' }
+      );
+      return; // no avanzar — el usuario debe repetir
+    }
+    valor = String(n);
   }
 
   sesion.datos[p.key] = valor;
   sesion.paso = i + 1;
+  await setSesion(chatId, sesion); // persistir
 
   const preview = valor.length > 120 ? valor.slice(0, 120) + '…' : valor;
   await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
@@ -678,17 +840,47 @@ async function procesarRespuesta(ctx, texto) {
     await ctx.reply(`${sig.p.msg}\n\n${progreso}`, { parse_mode: 'Markdown' });
   } else {
     sesion.modo = 'revisando';
+    await setSesion(chatId, sesion);
     await mostrarResumen(ctx, sesion);
   }
 }
 
-// ── Comandos ──────────────────────────────────────────────
+// ── Corrección desde resumen ──────────────────────────────
+async function aplicarCorreccion(ctx, sesion, chatId, texto) {
+  const key   = sesion.corrigiendoKey;
+  const p     = PREGUNTAS.find(q => q.key === key);
+  let valor   = key === 'nombre' ? limpiarNombre(texto) : texto;
+
+  if (p && p.numerico) {
+    const n = await extraerNumero(texto);
+    if (n === null) {
+      await ctx.reply(
+        '⚠️ No entendí ese número. Escríbalo en dígitos _(ej: 150000)_ o repítalo más claro.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    valor = String(n);
+  }
+
+  sesion.datos[key] = valor;
+  sesion.modo = 'revisando';
+  await setSesion(chatId, sesion); // persistir
+
+  const preview = valor.length > 80 ? valor.slice(0, 80) + '…' : valor;
+  await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
+  await mostrarResumen(ctx, sesion);
+}
+
+// ══════════════════════════════════════════════════════════
+// ── COMANDOS ──────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
 bot.command('start', async ctx => {
-  sesiones.delete(ctx.chat.id);
+  await delSesion(ctx.chat.id);
   await ctx.reply(
     '👋 *Bienvenido al Bot SENA · Línea CREAR Especial*\n\n' +
     '*Plan de Negocio:*\n' +
-    '📝 /nuevo — Crear plan de negocio (38 preguntas)\n' +
+    '📝 /nuevo — Crear plan de negocio\n' +
     '↩️ /atras — Corregir respuesta anterior\n' +
     '📋 /resumen — Ver y corregir todas las respuestas\n' +
     '✅ /listo — Generar el Excel oficial SENA\n' +
@@ -710,7 +902,7 @@ bot.command('start', async ctx => {
 });
 
 bot.command('nuevo', async ctx => {
-  sesiones.delete(ctx.chat.id);
+  await delSesion(ctx.chat.id);
   await ctx.reply('🆕 Iniciando nuevo plan de negocio...');
   const primera = getPregunta(0, {});
   if (primera) {
@@ -722,15 +914,16 @@ bot.command('nuevo', async ctx => {
 });
 
 bot.command('reiniciar', async ctx => {
-  sesiones.delete(ctx.chat.id);
+  await delSesion(ctx.chat.id);
   await ctx.reply('🔄 Plan cancelado. Usa /nuevo para empezar de cero.');
 });
 
 bot.command('atras', async ctx => {
   const chatId = ctx.chat.id;
-  const sesion = getSesion(chatId);
+  const sesion = await getSesion(chatId);
   if (sesion.modo === 'revisando') {
     sesion.modo = undefined;
+    await setSesion(chatId, sesion);
     await ctx.reply('↩️ Volviste al flujo de preguntas. Escribe /resumen cuando termines.');
     return;
   }
@@ -741,6 +934,7 @@ bot.command('atras', async ctx => {
   }
   delete sesion.datos[PREGUNTAS[lastIdx].key];
   sesion.paso = lastIdx;
+  await setSesion(chatId, sesion);
   const p = getPregunta(sesion.paso, sesion.datos);
   if (p) {
     await ctx.reply(
@@ -752,28 +946,56 @@ bot.command('atras', async ctx => {
 
 bot.command('resumen', async ctx => {
   const chatId = ctx.chat.id;
-  const sesion = sesiones.get(chatId);
+  const sesion = await getSesion(chatId);
   if (!sesion || Object.keys(sesion.datos).length === 0) {
     await ctx.reply('No hay ningún plan en curso. Usa /nuevo para empezar.');
     return;
   }
   sesion.modo = 'revisando';
+  await setSesion(chatId, sesion);
   await mostrarResumen(ctx, sesion);
 });
 
+// PUNTO 3: /listo protegido con validación de campos obligatorios
 bot.command('listo', async ctx => {
   const chatId = ctx.chat.id;
-  const sesion = sesiones.get(chatId);
+  const sesion = await getSesion(chatId);
+
   if (!sesion || sesion.modo !== 'revisando') {
     await ctx.reply('Primero completa el cuestionario. Usa /nuevo para empezar.');
     return;
   }
+
+  const faltantes = validarCamposObligatorios(sesion.datos);
+  if (faltantes.length > 0) {
+    await ctx.reply(
+      '⚠️ *Faltan estos datos obligatorios:*\n\n' +
+      faltantes.map(f => `• ${f}`).join('\n') +
+      '\n\nEscribe el *número* de la respuesta a corregir.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // Verificar aporte mínimo del 10%
+  const inv = Number(sesion.datos.inversion) || 0;
+  const ap  = Number(sesion.datos.aportePropio) || 0;
+  if (inv > 0 && ap / inv < 0.10) {
+    await ctx.reply(
+      `⚠️ El aporte propio (*${fmt(ap)}*) es menor al *10%* de la inversión total (*${fmt(inv)}*).\n\n` +
+      `Mínimo requerido: *${fmt(Math.ceil(inv * 0.10))}*\n\n` +
+      'Corrige el aporte propio (escribe el número correspondiente en el resumen) o la inversión total.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
   await finalizar(ctx, sesion);
-  sesiones.delete(chatId);
+  await delSesion(chatId);
 });
 
 bot.command('estado', async ctx => {
-  const sesion = getSesion(ctx.chat.id);
+  const sesion = await getSesion(ctx.chat.id);
   const actual = getPregunta(sesion.paso, sesion.datos);
   if (!actual) {
     await ctx.reply('No hay ningún plan en curso. Usa /nuevo para empezar.');
@@ -787,26 +1009,13 @@ bot.command('estado', async ctx => {
   );
 });
 
-// ── Corrección desde resumen ──────────────────────────────
-async function aplicarCorreccion(ctx, sesion, texto) {
-  const key   = sesion.corrigiendoKey;
-  const p     = PREGUNTAS.find(q => q.key === key);
-  let valor   = key === 'nombre' ? limpiarNombre(texto) : texto;
-  if (p && p.numerico) valor = String(await extraerNumero(texto));
-  sesion.datos[key] = valor;
-  sesion.modo = 'revisando';
-  const preview = valor.length > 80 ? valor.slice(0, 80) + '…' : valor;
-  await ctx.reply(`✅ _"${preview}"_`, { parse_mode: 'Markdown' });
-  await mostrarResumen(ctx, sesion);
-}
-
 // ── Mensajes de voz / audio ───────────────────────────────
 bot.on(['message:voice', 'message:audio'], async ctx => {
   const chatId = ctx.chat.id;
 
   // ── Flujo diagnóstico ──
-  if (dxSesiones.has(chatId)) {
-    const dxSesion = dxSesiones.get(chatId);
+  if (await hasDxSesion(chatId)) {
+    const dxSesion = await getDxSesion(chatId);
     if (dxSesion.paso >= DX_TOTAL) {
       await ctx.reply('El diagnóstico está completo. Usa /dx_listo para generar el Excel.');
       return;
@@ -825,7 +1034,7 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
   }
 
   // ── Flujo plan de negocio ──
-  const sesion       = getSesion(chatId);
+  const sesion       = await getSesion(chatId);
   const enRevision   = sesion.modo === 'revisando';
   const enCorreccion = sesion.modo === 'corrigiendo';
   const actual       = getPregunta(sesion.paso, sesion.datos);
@@ -844,7 +1053,7 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
     const texto  = await transcribir(fileId);
     await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
     if (enCorreccion) {
-      await aplicarCorreccion(ctx, sesion, texto);
+      await aplicarCorreccion(ctx, sesion, chatId, texto);
     } else {
       await procesarRespuesta(ctx, texto);
     }
@@ -860,8 +1069,8 @@ bot.on('message:text', async ctx => {
   const chatId = ctx.chat.id;
 
   // ── Flujo diagnóstico ──
-  if (dxSesiones.has(chatId)) {
-    const dxSesion = dxSesiones.get(chatId);
+  if (await hasDxSesion(chatId)) {
+    const dxSesion = await getDxSesion(chatId);
     if (dxSesion.paso >= DX_TOTAL) {
       await ctx.reply('El diagnóstico está completo. Usa /dx_listo para generar el Excel.');
       return;
@@ -871,7 +1080,7 @@ bot.on('message:text', async ctx => {
   }
 
   // ── Flujo plan de negocio ──
-  const sesion = getSesion(chatId);
+  const sesion = await getSesion(chatId);
 
   if (sesion.modo === 'revisando') {
     const n = parseInt(ctx.message.text.trim(), 10);
@@ -881,6 +1090,7 @@ bot.on('message:text', async ctx => {
       if (item) {
         sesion.modo = 'corrigiendo';
         sesion.corrigiendoKey = item.key;
+        await setSesion(chatId, sesion);
         const pregunta = PREGUNTAS.find(p => p.key === item.key);
         await ctx.reply(
           `✏️ *Corrigiendo #${n} — ${item.label}*\n\n${pregunta.msg}\n\n_Responde con voz 🎤 o escribe el nuevo valor:_`,
@@ -896,7 +1106,7 @@ bot.on('message:text', async ctx => {
   }
 
   if (sesion.modo === 'corrigiendo') {
-    await aplicarCorreccion(ctx, sesion, ctx.message.text);
+    await aplicarCorreccion(ctx, sesion, chatId, ctx.message.text);
     return;
   }
 
@@ -912,9 +1122,6 @@ bot.on('message:text', async ctx => {
 // ── FLUJO DE DIAGNÓSTICO EMPRESARIAL (40 preguntas 0/1/2) ─
 // ══════════════════════════════════════════════════════════
 
-const dxSesiones = new Map(); // chatId → { paso, datos }
-
-// ── Datos básicos del diagnóstico (10 preguntas) ──────────
 const DX_BASICOS = [
   { key: 'dxNombre',      msg: '¿Nombre completo del emprendedor?' },
   { key: 'dxCedula',      msg: '¿Número de cédula?' },
@@ -928,7 +1135,6 @@ const DX_BASICOS = [
   { key: 'dxDinamizador', msg: '¿Nombre del dinamizador que aplica el diagnóstico?' },
 ];
 
-// ── 40 preguntas diagnóstico (escala 0/1/2) ───────────────
 const DX_PREGUNTAS = [
   // Área 1 — Legal y Administrativa
   { area: 1, num: 1,  msg: '¿Para la planeación estratégica y fijación de objetivos tiene en cuenta al *cliente interno* y las tendencias del mercado?' },
@@ -979,7 +1185,7 @@ const DX_PREGUNTAS = [
 const DX_ESCALA = '\n\n🔢 *0* = No/Nunca · *1* = A veces/En proceso · *2* = Sí/Siempre';
 const DX_TOTAL  = DX_BASICOS.length + DX_PREGUNTAS.length; // 50
 
-// ── clasificar012: texto libre → 0, 1 o 2 (Claude) ───────
+// PUNTO 4: clasificar012 devuelve null en fallo (no 0 silencioso)
 async function clasificar012(texto) {
   const t = texto.trim();
   if (t === '0') return 0;
@@ -992,14 +1198,15 @@ async function clasificar012(texto) {
       messages:   [{ role: 'user', content: `Clasifica en 0=No/Nunca, 1=A veces/En proceso, 2=Sí/Siempre. Solo el número.\nRespuesta: "${texto}"` }],
     });
     const n = parseInt(msg.content[0].text.trim(), 10);
-    return isNaN(n) ? 0 : Math.min(2, Math.max(0, n));
-  } catch { return 0; }
+    if (isNaN(n)) return null; // no pudo clasificar → caller pide repetir
+    return Math.min(2, Math.max(0, n));
+  } catch {
+    return null; // API caída → null para que caller informe al usuario
+  }
 }
 
-// ── Generar Excel de Diagnóstico ──────────────────────────
 async function generarExcelDx(datos) {
-  const templatePath = path.join(__dirname, 'dx_template.xlsx');
-  const wb  = XLSX.readFile(templatePath, { cellFormula: true, cellStyles: true });
+  const wb    = XLSX.readFile(path.join(__dirname, 'dx_template.xlsx'), { cellFormula: true, cellStyles: true });
   const wsDx  = wb.Sheets['Diagnóstico'];
   const wsDup = wb.Sheets['Datos de la Unidad Productiva'];
 
@@ -1011,24 +1218,17 @@ async function generarExcelDx(datos) {
 
   const fecha = new Date().toLocaleDateString('es-CO');
 
-  // ── Hoja Diagnóstico — cabecera ──
   setD(wsDx, 'B4', datos.dxNegocio    || '');
   setD(wsDx, 'B5', datos.dxNombre     || '');
   setD(wsDx, 'B7', datos.dxDinamizador || '');
   setD(wsDx, 'B8', fecha);
 
-  // ── Hoja Diagnóstico — puntajes (col B) ──
   const scores = datos.scores || Array(40).fill(0);
-  // Área 1: filas 11-20
-  for (let i = 0; i < 10; i++) setD(wsDx, `B${11 + i}`, scores[i]);
-  // Área 2: filas 23-32
-  for (let i = 0; i < 10; i++) setD(wsDx, `B${23 + i}`, scores[10 + i]);
-  // Área 3: filas 35-44
-  for (let i = 0; i < 10; i++) setD(wsDx, `B${35 + i}`, scores[20 + i]);
-  // Área 4: filas 47-56
-  for (let i = 0; i < 10; i++) setD(wsDx, `B${47 + i}`, scores[30 + i]);
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${11 + i}`, scores[i] ?? 0);
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${23 + i}`, scores[10 + i] ?? 0);
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${35 + i}`, scores[20 + i] ?? 0);
+  for (let i = 0; i < 10; i++) setD(wsDx, `B${47 + i}`, scores[30 + i] ?? 0);
 
-  // ── Hoja DUP — datos básicos ──
   setD(wsDup, 'B7',  datos.dxNombre      || '');
   setD(wsDup, 'B8',  datos.dxCedula      || '');
   setD(wsDup, 'B10', datos.dxNegocio     || '');
@@ -1040,14 +1240,6 @@ async function generarExcelDx(datos) {
   setD(wsDup, 'B23', datos.dxDinamizador || '');
 
   return wb;
-}
-
-// ── Helpers diagnóstico ───────────────────────────────────
-function getDxSesion(chatId) {
-  if (!dxSesiones.has(chatId)) {
-    dxSesiones.set(chatId, { paso: 0, datos: { scores: Array(40).fill(null) } });
-  }
-  return dxSesiones.get(chatId);
 }
 
 function dxPreguntaMsg(paso) {
@@ -1069,7 +1261,7 @@ function dxResumenMsg(datos) {
   const s3 = scores.slice(20, 30).reduce((a, b) => a + (b || 0), 0);
   const s4 = scores.slice(30, 40).reduce((a, b) => a + (b || 0), 0);
   const total = s1 + s2 + s3 + s4;
-  const pct = (total / 80 * 100).toFixed(0);
+  const pct   = (total / 80 * 100).toFixed(0);
   const nivel = total <= 20 ? 'Inicio' : total <= 40 ? 'Básico' : total <= 60 ? 'Intermedio' : 'Avanzado';
 
   return [
@@ -1087,9 +1279,10 @@ function dxResumenMsg(datos) {
   ].join('\n');
 }
 
+// PUNTO 4: clasificar012 null → pide repetir, no guarda 0 silencioso
 async function dxProcesarRespuesta(ctx, texto) {
   const chatId = ctx.chat.id;
-  const sesion = getDxSesion(chatId);
+  const sesion = await getDxSesion(chatId);
   const paso   = sesion.paso;
 
   if (paso >= DX_TOTAL) {
@@ -1098,32 +1291,37 @@ async function dxProcesarRespuesta(ctx, texto) {
   }
 
   if (paso < DX_BASICOS.length) {
-    // Datos básicos: guardar como texto
     sesion.datos[DX_BASICOS[paso].key] = texto;
+    sesion.paso++;
+    await setDxSesion(chatId, sesion);
   } else {
-    // Pregunta diagnóstico: clasificar como 0/1/2
     const qi    = paso - DX_BASICOS.length;
     const score = await clasificar012(texto);
+    if (score === null) {
+      await ctx.reply(
+        '❌ No entendí esa respuesta. Por favor responda *0*, *1* o *2*:\n\n' +
+        '0 = No / Nunca\n1 = A veces / En proceso\n2 = Sí / Siempre',
+        { parse_mode: 'Markdown' }
+      );
+      return; // no avanzar
+    }
     sesion.datos.scores[qi] = score;
+    sesion.paso++;
+    await setDxSesion(chatId, sesion);
     await ctx.reply(`✅ *${score}*`, { parse_mode: 'Markdown' });
   }
 
-  sesion.paso++;
-
   if (sesion.paso >= DX_TOTAL) {
-    // Fin del cuestionario
     await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
   } else {
-    // Siguiente pregunta
-    const msg = dxPreguntaMsg(sesion.paso);
-    await ctx.reply(msg, { parse_mode: 'Markdown' });
+    await ctx.reply(dxPreguntaMsg(sesion.paso), { parse_mode: 'Markdown' });
   }
 }
 
 // ── Comandos diagnóstico ──────────────────────────────────
 bot.command('dx', async ctx => {
   const chatId = ctx.chat.id;
-  dxSesiones.delete(chatId);
+  await delDxSesion(chatId);
   await ctx.reply(
     '🏥 *Diagnóstico Empresarial SENA*\n\n' +
     'Vamos a evaluar 4 áreas de tu negocio con 40 preguntas.\n' +
@@ -1136,13 +1334,14 @@ bot.command('dx', async ctx => {
     'Primero necesito algunos datos básicos:',
     { parse_mode: 'Markdown' }
   );
-  const sesion = getDxSesion(chatId);
+  // Inicializar sesión en Redis
+  const sesion = await getDxSesion(chatId);
   await ctx.reply(dxPreguntaMsg(0), { parse_mode: 'Markdown' });
 });
 
 bot.command('dx_listo', async ctx => {
   const chatId = ctx.chat.id;
-  const sesion = dxSesiones.get(chatId);
+  const sesion = await getDxSesion(chatId);
   if (!sesion || sesion.paso < DX_BASICOS.length) {
     await ctx.reply('Primero completa el diagnóstico con /dx');
     return;
@@ -1176,24 +1375,23 @@ bot.command('dx_listo', async ctx => {
   });
   try { fs.unlinkSync(tmp); } catch {}
 
-  // Mostrar resumen de puntajes
   await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
-  dxSesiones.delete(chatId);
+  await delDxSesion(chatId);
   await ctx.reply('✨ Listo. Usa /dx para un nuevo diagnóstico o /nuevo para el plan de negocio.');
 });
 
 bot.command('dx_resumen', async ctx => {
-  const sesion = dxSesiones.get(ctx.chat.id);
-  if (!sesion) {
+  const sesion = await getDxSesion(ctx.chat.id);
+  if (!sesion || sesion.paso === 0) {
     await ctx.reply('No hay diagnóstico en curso. Usa /dx para empezar.');
     return;
   }
   await ctx.reply(dxResumenMsg(sesion.datos), { parse_mode: 'Markdown' });
 });
 
-// ── Health check (Render necesita puerto HTTP abierto) ────
+// ── Health check ──────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 http.createServer((_, res) => res.end('OK')).listen(PORT);
 
-console.log('🤖 Bot SENA CREAR v3 (Plan + Diagnóstico) iniciando…');
+console.log('🤖 Bot SENA CREAR v4 (Redis + validación + costos completos) iniciando…');
 bot.start();
