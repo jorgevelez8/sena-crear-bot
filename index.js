@@ -229,6 +229,7 @@ const CLAVES_OPCIONALES = new Set([
   'pvNuestro', 'pvAyuda', 'pvQue', 'pvMediante',
   'prod1Desc', 'prod1Unidad',
   'costosFijosDesc', 'manoObraTotal', 'gastosAdmin', 'permisosTotal',
+  // costosFijosTotal NO es opcional — sin ese número el modelo financiero queda vacío
   'impactoEco', 'impactoSocial',
 ]);
 
@@ -822,7 +823,8 @@ async function finalizar(ctx, sesion) {
   const numDoc = datos.numDoc;
   if (numDoc && _redis) {
     try {
-      await _redis.setex(`plan:cedula:${numDoc}`, 7 * 24 * 3600, JSON.stringify(datos));
+      // Llave incluye chatId: solo el chat que generó el plan puede retomarlo
+      await _redis.setex(`plan:chat:${ctx.chat.id}:${numDoc}`, 7 * 24 * 3600, JSON.stringify(datos));
     } catch (e) { console.error('redis save plan cedula:', e.message); }
   }
 }
@@ -1146,6 +1148,22 @@ bot.on(['message:voice', 'message:audio'], async ctx => {
   const enCorreccion = sesion.modo === 'corrigiendo';
   const actual       = getPregunta(sesion.paso, sesion.datos);
 
+  // ── FIX: voz en modo confirmando_viabilidad → redirige al handler de texto ──
+  if (sesion.modo === 'confirmando_viabilidad' || sesion.modo === 'esperando_cedula_retomar') {
+    const msg = await ctx.reply('🎤 Transcribiendo…');
+    try {
+      const fileId = ctx.message.voice?.file_id || ctx.message.audio?.file_id;
+      const texto  = await transcribir(fileId);
+      await ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {});
+      ctx.message.text = texto;
+      await ctx.emit('message', ctx.message);
+    } catch (e) {
+      console.error('Transcripción fallida:', e.message);
+      await ctx.reply('❌ No pude escuchar. Responde por escrito: *corregir* o *continuar*', { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
   if (!actual && !enCorreccion) {
     await ctx.reply(enRevision
       ? '📋 Estás revisando el plan. Escribe el número a corregir o */listo*.'
@@ -1216,7 +1234,7 @@ bot.on('message:text', async ctx => {
     }
     let datosGuardados = null;
     try {
-      const raw = await _redis.get(`plan:cedula:${cedula}`);
+      const raw = await _redis.get(`plan:chat:${chatId}:${cedula}`);
       if (raw) datosGuardados = typeof raw === 'string' ? JSON.parse(raw) : raw;
     } catch (e) { console.error('redis get cedula:', e.message); }
 
