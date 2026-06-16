@@ -221,6 +221,23 @@ const PREGUNTAS = [
   { key: 'impactoSocial', msg: '¿Qué *impacto social* tiene el proyecto?\n_(A cuántas familias ayuda, qué cambia en su comunidad)_' },
 ];
 
+// ── Claves de preguntas opcionales (se pueden saltar con "saltar"/"s") ──────
+// Todas las demás son obligatorias para el formato SENA oficial
+const CLAVES_OPCIONALES = new Set([
+  'genero', 'grupoPoblacional', 'ciiu', 'asociativo', 'numPersonas',
+  'lugarOps', 'clienteCual', 'competidor2', 'competidor3',
+  'pvNuestro', 'pvAyuda', 'pvQue', 'pvMediante',
+  'prod1Desc', 'prod1Unidad',
+  'costosFijosDesc', 'manoObraTotal', 'gastosAdmin', 'permisosTotal',
+  'impactoEco', 'impactoSocial',
+]);
+
+// Valor por defecto cuando se salta una pregunta opcional
+const DEFAULTS_OPCIONALES = {
+  asociativo:  'NO',
+  prod1Unidad: 'Unidad',
+};
+
 // ── Campos obligatorios para /listo ───────────────────────
 // PUNTO 3: /listo bloqueado si alguno falta
 const CAMPOS_REQUERIDOS = [
@@ -799,13 +816,22 @@ async function finalizar(ctx, sesion) {
     try { fs.unlinkSync(tmpPlan); } catch {}
   }
 
-  await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario.');
+  await ctx.reply('✨ Listo. El Excel oficial SENA ya tiene los datos listos para SharePoint.\nUsa /nuevo para el siguiente beneficiario o /retomar + cédula para editar este plan.');
+
+  // FIX 4: guardar plan completo en Redis por cédula (7 días)
+  const numDoc = datos.numDoc;
+  if (numDoc && _redis) {
+    try {
+      await _redis.setex(`plan:cedula:${numDoc}`, 7 * 24 * 3600, JSON.stringify(datos));
+    } catch (e) { console.error('redis save plan cedula:', e.message); }
+  }
 }
 
 // ══════════════════════════════════════════════════════════
 // ── PROCESAR RESPUESTA ────────────────────────────────────
 // ══════════════════════════════════════════════════════════
 // PUNTO 4: error de extraerNumero → pregunta al usuario, no guarda 0
+// FIX 2: saltar preguntas opcionales + progreso con tiempo estimado
 async function procesarRespuesta(ctx, texto) {
   const chatId = ctx.chat.id;
   const sesion = await getSesion(chatId);
@@ -813,6 +839,35 @@ async function procesarRespuesta(ctx, texto) {
   if (!actual) return;
 
   const { p, i } = actual;
+
+  // ── Manejo de "saltar" en preguntas opcionales ──
+  const esSkip = /^(saltar|s|no\s*s[eé]|no\s*aplica|omitir|pasar)$/i.test(texto.trim());
+  if (esSkip) {
+    if (!CLAVES_OPCIONALES.has(p.key)) {
+      await ctx.reply(
+        '⚠️ Esta pregunta es *obligatoria* para el formato SENA. Por favor respóndela.',
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+    sesion.datos[p.key] = DEFAULTS_OPCIONALES[p.key] || '';
+    sesion.paso = i + 1;
+    await setSesion(chatId, sesion);
+    await ctx.reply('⏭️ _Pregunta omitida._', { parse_mode: 'Markdown' });
+    const sig = getPregunta(sesion.paso, sesion.datos);
+    if (sig) {
+      const restantes = PREGUNTAS.length - sesion.paso;
+      const minutos   = Math.ceil(restantes * 0.5);
+      const progreso  = `_(${sesion.paso}/${PREGUNTAS.length} · ~${minutos} min)_`;
+      await ctx.reply(`${sig.p.msg}\n\n${progreso}`, { parse_mode: 'Markdown' });
+    } else {
+      sesion.modo = 'revisando';
+      await setSesion(chatId, sesion);
+      await mostrarResumen(ctx, sesion);
+    }
+    return;
+  }
+
   let valor = p.key === 'nombre' ? limpiarNombre(texto) : texto;
 
   if (p.numerico) {
@@ -836,7 +891,9 @@ async function procesarRespuesta(ctx, texto) {
 
   const sig = getPregunta(sesion.paso, sesion.datos);
   if (sig) {
-    const progreso = `_(${sesion.paso}/${PREGUNTAS.length})_`;
+    const restantes = PREGUNTAS.length - sesion.paso;
+    const minutos   = Math.ceil(restantes * 0.5);
+    const progreso  = `_(${sesion.paso}/${PREGUNTAS.length} · ~${minutos} min)_`;
     await ctx.reply(`${sig.p.msg}\n\n${progreso}`, { parse_mode: 'Markdown' });
   } else {
     sesion.modo = 'revisando';
@@ -881,6 +938,7 @@ bot.command('start', async ctx => {
     '👋 *Bienvenido al Bot SENA · Línea CREAR Especial*\n\n' +
     '*Plan de Negocio:*\n' +
     '📝 /nuevo — Crear plan de negocio\n' +
+    '🔁 /retomar — Recargar plan anterior por cédula\n' +
     '↩️ /atras — Corregir respuesta anterior\n' +
     '📋 /resumen — Ver y corregir todas las respuestas\n' +
     '✅ /listo — Generar el Excel oficial SENA\n' +
@@ -916,6 +974,22 @@ bot.command('nuevo', async ctx => {
 bot.command('reiniciar', async ctx => {
   await delSesion(ctx.chat.id);
   await ctx.reply('🔄 Plan cancelado. Usa /nuevo para empezar de cero.');
+});
+
+// FIX 4: /retomar — carga el último plan generado de un beneficiario por cédula
+bot.command('retomar', async ctx => {
+  const chatId = ctx.chat.id;
+  if (!_redis) {
+    await ctx.reply('⚠️ /retomar requiere Redis. Configura UPSTASH_REDIS_REST_URL en Render.');
+    return;
+  }
+  const sesion = await getSesion(chatId);
+  sesion.modo = 'esperando_cedula_retomar';
+  await setSesion(chatId, sesion);
+  await ctx.reply(
+    '🔁 *Retomar plan existente*\n\n¿Cuál es el *número de cédula* del beneficiario?\n_(Los planes se guardan 7 días después de generados)_',
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.command('atras', async ctx => {
@@ -985,6 +1059,39 @@ bot.command('listo', async ctx => {
       `⚠️ El aporte propio (*${fmt(ap)}*) es menor al *10%* de la inversión total (*${fmt(inv)}*).\n\n` +
       `Mínimo requerido: *${fmt(Math.ceil(inv * 0.10))}*\n\n` +
       'Corrige el aporte propio (escribe el número correspondiente en el resumen) o la inversión total.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // ── FIX 3: Alerta de viabilidad financiera ──────────────
+  const p1  = Number(sesion.datos.prod1Precio)       || 0;
+  const u1  = Number(sesion.datos.prod1UnidadesMes)  || 0;
+  const cv1 = Number(sesion.datos.prod1Costo)        || 0;
+  const cf1 = Number(sesion.datos.costosFijosTotal)  || 0;
+  const mo1 = Number(sesion.datos.manoObraTotal)     || 0;
+  const ga1 = Number(sesion.datos.gastosAdmin)       || 0;
+
+  const ingresoMes   = p1 * u1;
+  const cvMes        = cv1 * u1;
+  const margenMes    = ingresoMes - cvMes;
+  const costosFijMes = cf1 + mo1 + ga1;
+  const ebitdaMes    = margenMes - costosFijMes;
+
+  if (p1 > 0 && u1 > 0 && ebitdaMes < 0) {
+    sesion.modo = 'confirmando_viabilidad';
+    await setSesion(chatId, sesion);
+    await ctx.reply(
+      '⚠️ *Alerta financiera antes de generar el plan:*\n\n' +
+      `Ingresos al mes:       *${fmt(ingresoMes)}*\n` +
+      `Costo variable/mes:    *${fmt(cvMes)}*\n` +
+      `Costos fijos/mes:      *${fmt(costosFijMes)}*\n` +
+      `─────────────────────\n` +
+      `EBITDA mensual:        *${fmt(ebitdaMes)}* ❌\n\n` +
+      'Con estos números el negocio *pierde dinero cada mes*. ' +
+      'SENA puede rechazar el plan en la evaluación financiera.\n\n' +
+      '¿Quiere *corregir los datos* o *continuar de todas formas*?\n' +
+      '_Responda: *corregir* o *continuar*_',
       { parse_mode: 'Markdown' }
     );
     return;
@@ -1081,6 +1188,56 @@ bot.on('message:text', async ctx => {
 
   // ── Flujo plan de negocio ──
   const sesion = await getSesion(chatId);
+
+  // ── FIX 3: Confirmar generación pese a EBITDA negativo ──
+  if (sesion.modo === 'confirmando_viabilidad') {
+    const resp = ctx.message.text.trim().toLowerCase();
+    if (/^(continuar|si|sí|generar|ok|dale)$/i.test(resp)) {
+      sesion.modo = 'revisando';
+      await setSesion(chatId, sesion);
+      await ctx.reply('Generando el plan con los datos actuales…');
+      await finalizar(ctx, sesion);
+      await delSesion(chatId);
+    } else {
+      sesion.modo = 'revisando';
+      await setSesion(chatId, sesion);
+      await ctx.reply('Volviste al resumen. Corrige los datos y vuelve a escribir /listo.');
+      await mostrarResumen(ctx, sesion);
+    }
+    return;
+  }
+
+  // ── FIX 4: Buscar plan anterior por cédula ──────────────
+  if (sesion.modo === 'esperando_cedula_retomar') {
+    const cedula = ctx.message.text.trim().replace(/\D/g, '');
+    if (!cedula) {
+      await ctx.reply('Por favor escribe solo el número de cédula (sin puntos ni espacios).');
+      return;
+    }
+    let datosGuardados = null;
+    try {
+      const raw = await _redis.get(`plan:cedula:${cedula}`);
+      if (raw) datosGuardados = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch (e) { console.error('redis get cedula:', e.message); }
+
+    if (!datosGuardados) {
+      await ctx.reply(
+        `No encontré un plan para la cédula *${cedula}*.\n\nLos planes se guardan 7 días. Si pasó más tiempo, usa /nuevo para empezar de cero.`,
+        { parse_mode: 'Markdown' }
+      );
+      sesion.modo = undefined;
+      await setSesion(chatId, sesion);
+      return;
+    }
+
+    sesion.datos = datosGuardados;
+    sesion.paso  = PREGUNTAS.length;
+    sesion.modo  = 'revisando';
+    await setSesion(chatId, sesion);
+    await ctx.reply(`✅ Plan de *${datosGuardados.nombre || cedula}* cargado.`, { parse_mode: 'Markdown' });
+    await mostrarResumen(ctx, sesion);
+    return;
+  }
 
   if (sesion.modo === 'revisando') {
     const n = parseInt(ctx.message.text.trim(), 10);
